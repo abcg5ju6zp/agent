@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/buildkite/agent/v4/internal/redact"
 	"github.com/buildkite/agent/v4/internal/replacer"
@@ -19,6 +20,47 @@ import (
 // MaxCapturedErrorBody is the local request limit in bytes, before the parent
 // adds a timestamp and idempotency key.
 const MaxCapturedErrorBody = 32 << 10
+
+// CapturedErrorDetailBudget is the size in bytes the agent aims to keep the
+// message and JSON-encoded context of its own reports within, so captured
+// errors stay small to store. It is a target for reports the agent writes, not
+// a limit on reports it accepts.
+const CapturedErrorDetailBudget = 2 << 10
+
+// MaxCapturedErrorDetail is the largest diagnostic text, such as command
+// output, that CapturedErrorMessage reports without context. It leaves room
+// within CapturedErrorDetailBudget for redaction to lengthen short secrets,
+// such as a 6-byte value becoming "[REDACTED]".
+const MaxCapturedErrorDetail = CapturedErrorDetailBudget - 512
+
+// CapturedErrorDetailsSize returns the bytes a message and context count
+// against CapturedErrorDetailBudget.
+func CapturedErrorDetailsSize(message string, context map[string]any) (int, error) {
+	size := len(message)
+	if len(context) > 0 {
+		encoded, err := json.Marshal(context)
+		if err != nil {
+			return 0, fmt.Errorf("encoding captured error context: %w", err)
+		}
+		size += len(encoded)
+	}
+	return size, nil
+}
+
+// CapturedErrorMessage returns detail when it can be reported whole alongside
+// context within the budget, and fallback otherwise. Detail is never
+// truncated: a cut-off secret could escape redaction. Blank, invalid UTF-8, or
+// NUL-containing detail also falls back.
+func CapturedErrorMessage(detail, fallback string, context map[string]any) string {
+	if strings.TrimSpace(detail) == "" || !utf8.ValidString(detail) || strings.ContainsRune(detail, 0) {
+		return fallback
+	}
+	size, err := CapturedErrorDetailsSize(detail, context)
+	if err != nil || size > MaxCapturedErrorDetail {
+		return fallback
+	}
+	return detail
+}
 
 // UnmarshalJSON distinguishes omitted context from explicit null and preserves
 // JSON numbers on both the CLI and parent sides of the local transport.

@@ -362,3 +362,29 @@ func TestCapturedErrorBodyLimit(t *testing.T) {
 		})
 	}
 }
+
+func TestCapturedErrorMessage(t *testing.T) {
+	t.Parallel()
+
+	context := map[string]any{"k": "v"} // Encodes to 9 bytes.
+	for _, test := range []struct {
+		name, detail string
+		context      map[string]any
+		want         string
+	}{
+		{name: "detail", detail: "fatal: bad ref\n", want: "fatal: bad ref\n"},
+		{name: "detail at limit", detail: strings.Repeat("x", jobapi.MaxCapturedErrorDetail), want: strings.Repeat("x", jobapi.MaxCapturedErrorDetail)},
+		{name: "detail over limit", detail: strings.Repeat("x", jobapi.MaxCapturedErrorDetail+1), want: "fallback"},
+		{name: "detail and context at limit", detail: strings.Repeat("x", jobapi.MaxCapturedErrorDetail-9), context: context, want: strings.Repeat("x", jobapi.MaxCapturedErrorDetail-9)},
+		{name: "detail and context over limit", detail: strings.Repeat("x", jobapi.MaxCapturedErrorDetail-8), context: context, want: "fallback"},
+		{name: "blank", detail: " \n", want: "fallback"},
+		{name: "invalid UTF-8", detail: "bad \xff", want: "fallback"},
+		{name: "NUL", detail: "bad \x00", want: "fallback"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := jobapi.CapturedErrorMessage(test.detail, "fallback", test.context); got != test.want {
+				t.Errorf("CapturedErrorMessage() = %.40q, want %.40q", got, test.want)
+			}
+		})
+	}
+}
