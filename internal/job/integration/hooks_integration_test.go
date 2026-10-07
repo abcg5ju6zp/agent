@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -1048,6 +1049,27 @@ func TestHookFailuresAreCaptured(t *testing.T) {
 			}
 		})
 	}
+
+	t.Run("command hook", func(t *testing.T) {
+		t.Parallel()
+		tester, err := NewExecutorTester(mainCtx)
+		if err != nil {
+			t.Fatalf("NewExecutorTester() error = %v", err)
+		}
+		defer tester.Close()
+		agentAPI := newJobErrorsAPI(t, nil)
+
+		tester.ExpectGlobalHook("command").Once().AndExitWith(5)
+		if err := tester.Run(t, agentAPI.env()...); err == nil {
+			t.Fatalf("tester.Run() = nil, want command hook failure")
+		}
+		if slices.Contains(agentAPI.codes(), "hook_failed") {
+			t.Errorf("captured codes = %v, want the command hook left to command capture", agentAPI.codes())
+		}
+		if report := agentAPI.report(t, "command_failed"); report.Context["exit_status"] != float64(5) {
+			t.Errorf("command_failed context = %#v, want exit status 5", report.Context)
+		}
+	})
 
 	t.Run("repository hook", func(t *testing.T) {
 		t.Parallel()

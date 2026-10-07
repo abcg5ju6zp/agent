@@ -1,8 +1,10 @@
 package integration
 
 import (
+	"reflect"
 	"runtime"
 	"testing"
+	"time"
 
 	"github.com/buildkite/agent/v4/internal/job"
 	"github.com/buildkite/bintest/v3"
@@ -73,4 +75,117 @@ func TestPreExitHooksRunsAfterCommandFails(t *testing.T) {
 	}
 
 	tester.CheckMocks(t)
+}
+
+func TestCommandFailuresAreCaptured(t *testing.T) {
+	t.Parallel()
+
+	if runtime.GOOS == "windows" {
+		t.Skip("commands use POSIX shell syntax")
+	}
+
+	for _, test := range []struct {
+		name    string
+		env     []string
+		code    string
+		message string
+		context map[string]any
+	}{
+		{
+			name:    "exit status",
+			env:     []string{"BUILDKITE_COMMAND=echo 'Running the test suite'; exit 3"},
+			code:    "command_failed",
+			message: "The command exited with status 3.\n\nLast lines of output:\nRunning the test suite",
+			context: map[string]any{"command": "echo 'Running the test suite'; exit 3", "exit_status": float64(3)},
+		},
+		{
+			name:    "signal",
+			env:     []string{"BUILDKITE_COMMAND=kill -KILL $$"},
+			code:    "command_failed",
+			message: "The command was terminated by signal SIGKILL. The operating system may have killed it for using too much memory.",
+			context: map[string]any{"command": "kill -KILL $$", "exit_status": float64(-1), "signal": "SIGKILL"},
+		},
+		{
+			name: "missing command",
+			env:  []string{"BUILDKITE_COMMAND="},
+			code: "command_missing",
+		},
+		{
+			name: "command eval disabled",
+			env:  []string{"BUILDKITE_COMMAND=echo hello", "BUILDKITE_COMMAND_EVAL=false"},
+			code: "command_eval_disabled",
+		},
+		{
+			name:    "command not run",
+			env:     []string{"BUILDKITE_COMMAND=echo hello", `BUILDKITE_SHELL=/bin/bash "-c`},
+			code:    "command_not_run",
+			message: `failed to split shell ("/bin/bash \"-c") into tokens: expected closing quote " at offset 12, got EOF`,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			tester, err := NewExecutorTester(mainCtx)
+			if err != nil {
+				t.Fatalf("NewExecutorTester() error = %v", err)
+			}
+			defer tester.Close()
+			agentAPI := newJobErrorsAPI(t, nil)
+
+			if err := tester.Run(t, append(agentAPI.env(), test.env...)...); err == nil {
+				t.Fatalf("tester.Run() = nil, want command failure")
+			}
+
+			report := agentAPI.report(t, test.code)
+			if test.message != "" && report.Message != test.message {
+				t.Errorf("message = %q, want %q", report.Message, test.message)
+			}
+			if test.context != nil && !reflect.DeepEqual(report.Context, test.context) {
+				t.Errorf("context = %#v, want %#v", report.Context, test.context)
+			}
+		})
+	}
+}
+
+func TestCancelledCommandIsNotCaptured(t *testing.T) {
+	t.Parallel()
+
+	if runtime.GOOS == "windows" {
+		t.Skip("cancellation uses SIGINT")
+	}
+
+	tester, err := NewExecutorTester(mainCtx)
+	if err != nil {
+		t.Fatalf("NewExecutorTester() error = %v", err)
+	}
+	defer tester.Close()
+	agentAPI := newJobErrorsAPI(t, nil)
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	defer close(release)
+	tester.MustMock(t, "blocking-command").Expect().Once().AndCallFunc(func(c *bintest.Call) {
+		close(started)
+		<-release
+		c.Exit(1)
+	})
+
+	runDone := make(chan error, 1)
+	go func() { runDone <- tester.Run(t, append(agentAPI.env(), "BUILDKITE_COMMAND=blocking-command")...) }()
+	select {
+	case <-started:
+	case <-time.After(30 * time.Second):
+		t.Fatal("timed out waiting for command to start")
+	}
+	if err := tester.Cancel(); err != nil {
+		t.Fatalf("tester.Cancel() = %v", err)
+	}
+	select {
+	case <-runDone:
+	case <-time.After(30 * time.Second):
+		t.Fatal("timed out waiting for cancelled job to finish")
+	}
+
+	if codes := agentAPI.codes(); len(codes) != 0 {
+		t.Errorf("captured codes = %v, want none for a cancelled job", codes)
+	}
 }

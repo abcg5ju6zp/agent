@@ -72,6 +72,50 @@ func (e *Executor) hookDisplayPath(hookCfg HookConfig) string {
 	return hookCfg.Path
 }
 
+// captureCommandError reports a command that failed or could not be run,
+// whether run by default or by a command hook, with the end of its output.
+func (e *Executor) captureCommandError(ctx context.Context, err error) {
+	details := map[string]any{}
+	// Long scripts are already in the step definition.
+	if command := strings.TrimSpace(e.Command); command != "" && len(command) <= 256 {
+		details["command"] = command
+	}
+	switch {
+	case addExitDetails(details, err):
+		if scope := e.commandHookScope(); scope != "" {
+			details["command_hook"] = scope
+		}
+		message := fmt.Sprintf("The command exited with status %d.", shell.ExitCode(err))
+		if signal, ok := details["signal"]; ok {
+			message = fmt.Sprintf("The command was terminated by signal %s.", signal)
+			if signal == "SIGKILL" {
+				message += " The operating system may have killed it for using too much memory."
+			}
+		}
+		captureJobError(ctx, e.shell, "command_failed", e.withRecentOutput(message, details), details)
+	case errors.Is(err, errNoCommand):
+		captureJobError(ctx, e.shell, "command_missing", err.Error(), nil)
+	case errors.Is(err, errCommandEvalDisabled), errors.Is(err, errCommandOutsideRepository):
+		captureJobError(ctx, e.shell, "command_eval_disabled", err.Error(), details)
+	default:
+		captureJobError(ctx, e.shell, "command_not_run", jobapi.CapturedErrorMessage(err.Error(), "The command could not be run.", details), details)
+	}
+}
+
+// commandHookScope reports which command hook replaced the step's command, if
+// any, in the order runCommand chooses one.
+func (e *Executor) commandHookScope() string {
+	switch {
+	case e.hasPluginHook("command"):
+		return HookScopePlugin
+	case e.hasLocalHook("command"):
+		return HookScopeRepository
+	case e.hasGlobalHook("command"):
+		return HookScopeAgent
+	}
+	return ""
+}
+
 // withRecentOutput appends the end of the redacted output from the hook,
 // command, or plugin checkout that just failed, using whatever room the
 // detail budget leaves after the summary and context.
