@@ -9,7 +9,8 @@ by the Buildkite backend as `BUILDKITE_GIT_REMOTE_MIRROR_URL`. The agent may
 fetch objects from it, but the canonical repository (`BUILDKITE_REPO`) remains
 the source of truth for what to build and stays the checkout's `origin`.
 
-Read [`git-mirror.md`](git-mirror.md) first. It describes the pre-existing
+Read the [Git mirrors documentation](https://buildkite.com/docs/agent/self-hosted/configure/git-mirrors)
+first. It describes the pre-existing
 **on-host** mirror (`--git-mirrors-path`), which is a different thing that
 happens to share the word "mirror". This document uses:
 
@@ -703,7 +704,8 @@ Each part of that earns its place:
 
 - **A ref rather than `FETCH_HEAD`**, because `FETCH_HEAD` is not a ref: the
   objects would be unreferenced and therefore `gc` fodder, which is the
-  corruption mode `git-mirror.md` documents. G4 also shows the later
+  checkout corruption mode described in the NOTE under `--shared` in the
+  [`git clone` documentation](https://git-scm.com/docs/git-clone). G4 also shows the later
   `--reference` clone's negotiation reads the alternate's refs, so an
   unreferenced object store would not even help.
 - **A namespace rather than `refs/heads/<branch>`**, because writing the build
@@ -1402,7 +1404,8 @@ requests**: `init.templateDir`, `http.proxy`, `GIT_SSL_*`, `GIT_SSH_COMMAND`,
 transport flags.*
 
 **C7 — On-host mirror `gc` can still unreference objects a checkout depends
-on.** Pre-existing, documented in `git-mirror.md`, mitigated by `dissociate`
+on.** Pre-existing (see the NOTE under `--shared` in the
+[`git clone` documentation](https://git-scm.com/docs/git-clone)), mitigated by `dissociate`
 mode and snapshots. The namespaced ref is force-updated, so it does not only
 grow the pinned set: a build targeting a commit outside the previous target's
 ancestry (a rebuild of an older commit, a force-push) shrinks it. That is the
@@ -1413,8 +1416,8 @@ ref. *Comment: in `checkout_mirror.go`.*
 **C8 — On a mirror-hit steady state the on-host mirror's `refs/heads/*` stop
 advancing,** because the canonical fetch is skipped. The namespaced refs keep
 the built history reachable, and negotiation stays effective for the branches
-being built; other branches' refs age. `git-mirror.md` names disk usage as one
-of the mirror's two goals, and this shifts what the mirror retains rather than
+being built; other branches' refs age. Reducing disk usage is one of the on-host
+mirror's two goals (with reducing network bandwidth), and this shifts what the mirror retains rather than
 growing it without bound. *Comment: in `checkout_mirror.go`.*
 
 **C9 — Submodules never use the remote mirror.** The backend knows only the main
@@ -1427,7 +1430,7 @@ initialization.
 its endpoint from `remote.origin.url`. An LFS-heavy repository therefore gets no
 *remote* mirror benefit for its LFS objects. (The separate, opt-in
 `--git-mirrors-lfs-cache` caches LFS objects fetched from canonical in the
-*on-host* mirror; see [`git-mirror.md`](git-mirror.md). It does not change
+*on-host* mirror. It does not change
 where LFS objects are downloaded from.) The one window where that reasoning inverts
 is PR 4's clone, where `origin` is still the mirror: an LFS repository whose
 mirror does not proxy LFS fails that clone and falls back to canonical, which is
