@@ -2,7 +2,9 @@ package secrets
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -137,4 +139,30 @@ func FetchSecrets(ctx context.Context, l logger.Logger, client APIClient, jobID 
 	}
 
 	return secrets, nil
+}
+
+// DescribeFetchErrors summarizes failed fetches for a captured job error. It
+// returns the keys that failed and a message naming each key with Buildkite's
+// response, leaving out request URLs. Fetch errors never contain secret values.
+func DescribeFetchErrors(errs []error) (failedKeys []string, message string) {
+	var b strings.Builder
+	b.WriteString("Could not fetch these secrets for the job:")
+	for _, err := range errs {
+		key, reason := "(all secrets)", err
+		if secretErr := new(SecretError); errors.As(err, &secretErr) {
+			failedKeys = append(failedKeys, secretErr.Key)
+			key, reason = secretErr.Key, secretErr.Err
+		}
+		errResp := new(api.ErrorResponse)
+		switch {
+		case errors.As(reason, &errResp) && errResp.Response != nil && errResp.Message != "":
+			fmt.Fprintf(&b, "\n- %s: %s: %s", key, errResp.Response.Status, errResp.Message)
+		case errors.As(reason, &errResp) && errResp.Response != nil:
+			fmt.Fprintf(&b, "\n- %s: %s", key, errResp.Response.Status)
+		default:
+			fmt.Fprintf(&b, "\n- %s: %v", key, reason)
+		}
+	}
+	b.WriteString("\nCheck that each secret exists in the job's cluster and that this pipeline is allowed to use it.")
+	return failedKeys, b.String()
 }

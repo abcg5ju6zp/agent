@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -877,5 +878,61 @@ func TestSecretsIntegration_SecretEnabledLFSSetsSkipSmudge(t *testing.T) {
 
 	if !strings.Contains(tester.Output, `SKIP_SMUDGE="1"`) {
 		t.Fatalf("expected GIT_LFS_SKIP_SMUDGE=1 before checkout after a secret enabled LFS, got: %s", tester.Output)
+	}
+}
+
+func TestSecretsIntegration_FailuresAreCaptured(t *testing.T) {
+	t.Parallel()
+
+	for _, test := range []struct {
+		name    string
+		secrets []pipeline.Secret
+		code    string
+		message string
+		context map[string]any
+	}{
+		{
+			name:    "fetch failure",
+			secrets: []pipeline.Secret{{Key: "VALID_SECRET"}, {Key: "MISSING_SECRET"}},
+			code:    "secrets_fetch_failed",
+			message: "- MISSING_SECRET: 404 Not Found: Not Found: method = GET",
+			context: map[string]any{"failed_keys": []any{"MISSING_SECRET"}},
+		},
+		{
+			name:    "protected environment variable",
+			secrets: []pipeline.Secret{{Key: "VALID_SECRET", EnvironmentVariable: "BUILDKITE_AGENT_ACCESS_TOKEN"}},
+			code:    "secret_environment_variable_rejected",
+			message: `secret "VALID_SECRET" cannot set protected environment variable "BUILDKITE_AGENT_ACCESS_TOKEN". Map the secret to a different environment_variable in the step.`,
+			context: map[string]any{"key": "VALID_SECRET", "environment_variable": "BUILDKITE_AGENT_ACCESS_TOKEN"},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			tester, err := NewExecutorTester(mainCtx)
+			if err != nil {
+				t.Fatalf("setting up executor tester: %v", err)
+			}
+			defer tester.Close()
+
+			secretsAPI := setupSecretsAPIServer(t, map[string]string{"VALID_SECRET": "valid-secret-value"})
+			defer secretsAPI.Close()
+			agentAPI := newJobErrorsAPI(t, secretsAPI.Config.Handler)
+
+			secretsJSON, err := json.Marshal(test.secrets)
+			if err != nil {
+				t.Fatalf("marshaling secrets: %v", err)
+			}
+			if err := tester.Run(t, append(agentAPI.env(), "BUILDKITE_SECRETS_CONFIG="+string(secretsJSON))...); err == nil {
+				t.Fatalf("expected job to fail. Full output: %s", tester.Output)
+			}
+
+			report := agentAPI.report(t, test.code)
+			if !strings.Contains(report.Message, test.message) || strings.Contains(report.Message, "valid-secret-value") {
+				t.Errorf("message = %q, want it to contain %q and no secret value", report.Message, test.message)
+			}
+			if !reflect.DeepEqual(report.Context, test.context) {
+				t.Errorf("context = %#v, want %#v", report.Context, test.context)
+			}
+		})
 	}
 }

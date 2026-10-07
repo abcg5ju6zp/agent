@@ -1085,6 +1085,10 @@ func (e *Executor) fetchAndSetSecrets(ctx context.Context) error {
 		for _, err := range errs {
 			fmt.Fprintf(&errorMsg, "\n   %s", err)
 		}
+		failedKeys, detail := secrets.DescribeFetchErrors(errs)
+		details := map[string]any{"failed_keys": failedKeys}
+		fallback := fmt.Sprintf("Failed to fetch %d of the step's %d secrets. Check that each secret exists in the job's cluster and that this pipeline is allowed to use it.", len(errs), len(keys))
+		captureJobError(ctx, e.shell, "secrets_fetch_failed", jobapi.CapturedErrorMessage(detail, fallback, details), details)
 		return errors.New(errorMsg.String())
 	}
 
@@ -1102,11 +1106,18 @@ func (e *Executor) fetchAndSetSecrets(ctx context.Context) error {
 			// Set the environment variable only if environment_variable is specified and non-nil
 			if pipelineSecret.EnvironmentVariable != "" {
 				// Check if the environment variable is protected
-				if env.IsProtected(pipelineSecret.EnvironmentVariable) {
-					return fmt.Errorf("secret %q cannot set protected environment variable %q", pipelineSecret.Key, pipelineSecret.EnvironmentVariable)
+				var rejected error
+				switch {
+				case env.IsProtected(pipelineSecret.EnvironmentVariable):
+					rejected = fmt.Errorf("secret %q cannot set protected environment variable %q", pipelineSecret.Key, pipelineSecret.EnvironmentVariable)
+				case env.IsCheckoutLockedForSecrets(pipelineSecret.EnvironmentVariable, e.CheckoutOverrideMode):
+					rejected = fmt.Errorf("secret %q cannot set checkout-locked environment variable %q while BUILDKITE_CHECKOUT_OVERRIDE_MODE=%s", pipelineSecret.Key, pipelineSecret.EnvironmentVariable, e.CheckoutOverrideMode)
 				}
-				if env.IsCheckoutLockedForSecrets(pipelineSecret.EnvironmentVariable, e.CheckoutOverrideMode) {
-					return fmt.Errorf("secret %q cannot set checkout-locked environment variable %q while BUILDKITE_CHECKOUT_OVERRIDE_MODE=%s", pipelineSecret.Key, pipelineSecret.EnvironmentVariable, e.CheckoutOverrideMode)
+				if rejected != nil {
+					details := map[string]any{"key": pipelineSecret.Key, "environment_variable": pipelineSecret.EnvironmentVariable}
+					message := jobapi.CapturedErrorMessage(rejected.Error()+". Map the secret to a different environment_variable in the step.", "A secret cannot set a protected environment variable. Map it to a different environment_variable in the step.", details)
+					captureJobError(ctx, e.shell, "secret_environment_variable_rejected", message, details)
+					return rejected
 				}
 
 				var alreadySet bool
