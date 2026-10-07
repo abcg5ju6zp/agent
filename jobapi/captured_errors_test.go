@@ -58,14 +58,19 @@ func TestCapturedErrorRedactionResponse(t *testing.T) {
 			wantError: "redacting captured error: code must be a nonblank string of at most 255 bytes without NUL",
 		},
 		{
-			name:      "redaction expands message beyond 2 KiB",
-			body:      `{"code":"x","message":"` + strings.Repeat("q", 205) + `"}`,
-			wantError: "redacting captured error: message exceeds 2048 bytes; shorten the message",
+			name:      "redaction pushes the message over the shared budget",
+			body:      `{"code":"x","message":"` + strings.Repeat("q", 154) + `"}`,
+			wantError: "redacting captured error: code, message and context exceed the combined 1536-byte limit; shorten the message or move details to an annotation or artifact",
 		},
 		{
-			name:      "redaction expands context beyond 2 KiB",
-			body:      `{"code":"x","message":"Failed","context":{"detail":"` + strings.Repeat("q", 204) + `"}}`,
-			wantError: "redacting captured error: context exceeds 2048 bytes after JSON encoding; reduce the context",
+			name:      "redaction pushes the context over the shared budget",
+			body:      `{"code":"x","message":"Failed","context":{"detail":"` + strings.Repeat("q", 152) + `"}}`,
+			wantError: "redacting captured error: code, message and context exceed the combined 1536-byte limit; shorten the message or move details to an annotation or artifact",
+		},
+		{
+			name:      "redaction pushes the code over the shared budget",
+			body:      `{"code":"q","message":"` + strings.Repeat("x", 1525) + `"}`,
+			wantError: "redacting captured error: code, message and context exceed the combined 1536-byte limit; shorten the message or move details to an annotation or artifact",
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -232,7 +237,7 @@ func TestCapturedErrorRejectsMalformedAndUnauthenticatedRequests(t *testing.T) {
 	}
 }
 
-func TestCapturedErrorFieldLimits(t *testing.T) {
+func TestCapturedErrorSharedBudget(t *testing.T) {
 	t.Parallel()
 
 	reported := make(chan *jobapi.CapturedError, 1)
@@ -248,20 +253,32 @@ func TestCapturedErrorFieldLimits(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = srv.Stop() })
 
-	message := strings.Repeat("é", 1024)
+	message := strings.Repeat("é", 200)
 	// The JSON object adds 13 bytes; each newline and é pair adds four.
-	detail := strings.Repeat("\né", 508) + "éx"
+	detail := strings.Repeat("\né", 280) + "é"
+	contextWithDetail := func(detail string) map[string]any { return map[string]any{"detail": detail} }
 	for _, test := range []struct {
-		name, message, detail, wantError string
+		name, code, message string
+		context             map[string]any
+		wantError           bool
 	}{
-		{"both fields at 2 KiB", message, detail, ""},
-		{"message limit counts text, not JSON escapes", strings.Repeat("\n", 2047) + "x", "", ""},
-		{"message one byte over", message + "x", detail, "message exceeds 2048 bytes; shorten the message"},
-		{"context one byte over", message, detail + "x", "context exceeds 2048 bytes after JSON encoding; reduce the context"},
-		{"JSON escaping counts towards context size", "Failed", strings.Repeat("<", 340), "context exceeds 2048 bytes after JSON encoding; reduce the context"},
+		{"1535 bytes", "x", message, contextWithDetail(strings.Repeat("\né", 280) + "a"), false},
+		{"1536 bytes", "x", message, contextWithDetail(detail), false},
+		{"1537 bytes from message", "x", message + "x", contextWithDetail(detail), true},
+		{"1537 bytes from context", "x", message, contextWithDetail(detail + "x"), true},
+		{"1537 bytes from code", "xx", message, contextWithDetail(detail), true},
+		{"omitted context counts as an empty object", "x", strings.Repeat("é", 766) + "x", nil, false},
+		{"omitted context still uses two bytes", "x", strings.Repeat("é", 767), nil, true},
+		{"explicit empty context uses the same budget", "x", strings.Repeat("é", 766) + "x", map[string]any{}, false},
+		{"message counts text rather than JSON escapes", "x", strings.Repeat("\n", 1532) + "x", nil, false},
+		{"JSON escapes count towards the shared budget", "x", "Failed", contextWithDetail(strings.Repeat("<", 253)), true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			body, err := json.Marshal(jobapi.CapturedError{Code: "x", Message: test.message, Context: map[string]any{"detail": test.detail}})
+			request := map[string]any{"code": test.code, "message": test.message}
+			if test.context != nil {
+				request["context"] = test.context
+			}
+			body, err := json.Marshal(request)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -275,7 +292,7 @@ func TestCapturedErrorFieldLimits(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer func() { _ = resp.Body.Close() }()
-			if test.wantError != "" {
+			if test.wantError {
 				if resp.StatusCode != http.StatusBadRequest {
 					t.Errorf("status = %d, want 400", resp.StatusCode)
 				}
@@ -283,23 +300,27 @@ func TestCapturedErrorFieldLimits(t *testing.T) {
 				if err := json.NewDecoder(resp.Body).Decode(&response); err != nil {
 					t.Fatal(err)
 				}
-				if response.Error != test.wantError {
-					t.Errorf("error = %q, want %q", response.Error, test.wantError)
+				const wantError = "code, message and context exceed the combined 1536-byte limit; shorten the message or move details to an annotation or artifact"
+				if response.Error != wantError {
+					t.Errorf("error = %q, want %q", response.Error, wantError)
 				}
 			} else if resp.StatusCode != http.StatusCreated {
 				t.Fatalf("status = %d, want 201", resp.StatusCode)
 			}
 			select {
 			case payload := <-reported:
-				if test.wantError != "" {
-					t.Fatal("oversized fields were forwarded")
+				if test.wantError {
+					t.Fatal("oversized report was forwarded")
 				}
-				if payload.Message != test.message || payload.Context["detail"] != test.detail {
-					t.Error("fields within the limit were changed")
+				if payload.Code != test.code || payload.Message != test.message {
+					t.Error("code or message within the budget was changed")
+				}
+				if diff := cmp.Diff(test.context, payload.Context); diff != "" {
+					t.Errorf("context diff (-want +got):\n%s", diff)
 				}
 			default:
-				if test.wantError == "" {
-					t.Error("fields within the limit were not forwarded")
+				if !test.wantError {
+					t.Error("report within the budget was not forwarded")
 				}
 			}
 		})
@@ -322,7 +343,7 @@ func TestCapturedErrorBodyLimit(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = srv.Stop() })
 
-	message := strings.Repeat("é", 1024)
+	message := strings.Repeat("é", 700)
 	body := `{"code":"x","message":"` + message + `","context":{"detail":"kept"}}`
 	for _, test := range []struct {
 		name string

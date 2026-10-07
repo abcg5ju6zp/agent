@@ -36,15 +36,19 @@ reporting them. This does not automatically detect other sensitive information.
 Redacted numbers become strings. Reports are rejected if redaction causes
 duplicate context keys, an invalid error code, or an oversized payload.
 
-Message and context are each limited to 2 KiB (2048 bytes), checked by the
-parent agent before and after redaction. Message size is measured in UTF-8
-bytes; context size includes Go's compact JSON encoding and escapes.
-Oversized fields are rejected, not shortened. Reduce them and try again.
+Code, message and context share a 1536-byte budget, checked by the parent agent
+before and after redaction. Code and message count as UTF-8 bytes; context
+counts as compact JSON, including escapes. Omitted context counts as {}.
+Oversized reports are rejected, not shortened. Keep the error brief and put
+detailed output in an annotation or artifact.
+
+This experimental budget leaves room for identifiers and storage overhead,
+aiming for rows around 2 KiB. It is not a physical row-size or no-TOAST guarantee.
 
 The whole report is still limited to 32 KiB, including JSON encoding.
 Raw context input is also limited to 32 KiB before parsing.
-Buildkite still checks sizes on the server: PostgreSQL can format JSON
-differently, so accepted context may still be replaced with a truncation marker.
+Buildkite checks the budget independently. Server JSON normalization can change
+the size near the limit, so a report accepted by the agent may still be rejected.
 
 Note: This feature is currently in development and subject to change. It is not
 yet available to all customers.`

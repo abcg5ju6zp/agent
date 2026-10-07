@@ -20,7 +20,8 @@ import (
 // adds a timestamp and idempotency key.
 const MaxCapturedErrorBody = 32 << 10
 
-const maxCapturedErrorFieldSize = 2 << 10
+// Leave room for IDs and storage overhead; this is not a physical row-size limit.
+const maxCapturedErrorSize = 1536
 
 // UnmarshalJSON distinguishes omitted context from explicit null and preserves
 // JSON numbers on both the CLI and parent sides of the local transport.
@@ -220,15 +221,16 @@ func validateCapturedError(e *CapturedError) error {
 	if strings.TrimSpace(e.Message) == "" || strings.ContainsRune(e.Message, 0) {
 		return errors.New("message must be a nonblank string without NUL")
 	}
-	if len(e.Message) > maxCapturedErrorFieldSize {
-		return fmt.Errorf("message exceeds %d bytes; shorten the message", maxCapturedErrorFieldSize)
+	contextSize := 2 // Omitted context is stored as {}.
+	if e.Context != nil {
+		context, err := json.Marshal(e.Context)
+		if err != nil {
+			return fmt.Errorf("encoding context: %w", err)
+		}
+		contextSize = len(context)
 	}
-	context, err := json.Marshal(e.Context)
-	if err != nil {
-		return fmt.Errorf("encoding context: %w", err)
-	}
-	if len(context) > maxCapturedErrorFieldSize {
-		return fmt.Errorf("context exceeds %d bytes after JSON encoding; reduce the context", maxCapturedErrorFieldSize)
+	if len(e.Code)+len(e.Message)+contextSize > maxCapturedErrorSize {
+		return fmt.Errorf("code, message and context exceed the combined %d-byte limit; shorten the message or move details to an annotation or artifact", maxCapturedErrorSize)
 	}
 	if e.IdempotencyKey != "" {
 		return errors.New("idempotency_key is assigned by the parent agent and must be omitted")

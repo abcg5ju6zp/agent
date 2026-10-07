@@ -146,23 +146,24 @@ func TestJobCaptureErrorRejectsInvalidArgumentsBeforeTransport(t *testing.T) {
 	}
 }
 
-func TestJobCaptureErrorReportsOversizedFields(t *testing.T) {
+func TestJobCaptureErrorReportsExceededBudget(t *testing.T) {
 	startCaptureErrorTestServer(t, func(context.Context, *jobapi.CapturedError) error {
-		t.Error("oversized fields must not be reported")
+		t.Error("oversized reports must not be forwarded")
 		return nil
 	})
 	t.Setenv("BUILDKITE_AGENT_JOB_CAPTURE_ERROR_CONTEXT", "")
 	for _, test := range []struct {
-		name, message, input, want string
+		name, message, input string
 	}{
-		{"message", strings.Repeat("é", 1024) + "x", `{}`, "message exceeds 2048 bytes; shorten the message"},
-		{"context", "Failed", `{"detail":"` + strings.Repeat("x", 2036) + `"}`, "context exceeds 2048 bytes after JSON encoding; reduce the context"},
+		{"message", strings.Repeat("é", 767), `{}`},
+		{"context", "Failed", `{"detail":"` + strings.Repeat("x", 1517) + `"}`},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			app := captureErrorTestApp()
 			err := app.Run(t.Context(), []string{"buildkite-agent", "capture-error", "x", "--message", test.message, "--context", test.input})
-			if err == nil || !strings.Contains(err.Error(), test.want) {
-				t.Fatalf("capture-error error = %v, want %q", err, test.want)
+			const want = "code, message and context exceed the combined 1536-byte limit; shorten the message or move details to an annotation or artifact"
+			if err == nil || !strings.Contains(err.Error(), want) {
+				t.Fatalf("capture-error error = %v, want %q", err, want)
 			}
 		})
 	}
