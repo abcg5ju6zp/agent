@@ -2,11 +2,13 @@ package clicommand
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"slices"
 
 	"github.com/buildkite/agent/v4/api"
 	"github.com/buildkite/agent/v4/internal/artifact"
+	"github.com/buildkite/agent/v4/jobapi"
 	"github.com/urfave/cli/v3"
 	"go.opentelemetry.io/otel"
 )
@@ -111,6 +113,17 @@ var ArtifactDownloadCommand = &cli.Command{
 
 		// Download the artifacts
 		if err := downloader.Download(ctx); err != nil {
+			details := map[string]any{"query": cfg.Query, "build": cfg.Build}
+			if cfg.Step != "" {
+				details["step"] = cfg.Step
+			}
+			summary := fmt.Sprintf("Failed to download artifacts matching %q", cfg.Query)
+			detail, fallback := summary+": "+storageErrorText(err), summary+"."
+			if errors.Is(err, artifact.ErrNoArtifactsFound) {
+				detail = fmt.Sprintf("No artifacts uploaded to the build matched %q. Check that the pattern matches the uploaded paths, and that the step uploading them finishes before this one starts, for example by adding depends_on.", cfg.Query)
+				fallback = detail
+			}
+			captureAgentError(ctx, l, "artifact_download_failed", jobapi.CapturedErrorMessage(detail, fallback, details), details)
 			return fmt.Errorf("failed to download artifacts: %w", err)
 		}
 
