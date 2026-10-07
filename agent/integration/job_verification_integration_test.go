@@ -1,6 +1,7 @@
 package integration
 
 import (
+	"maps"
 	"strings"
 	"testing"
 
@@ -802,4 +803,102 @@ func jwksFromKeys(t *testing.T, jwkes ...jwk.Key) jwk.Set {
 	}
 
 	return set
+}
+
+func TestJobVerificationFailuresAreCaptured(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name             string
+		job              api.Job
+		behavior         string
+		signingKey       jwk.Key
+		verificationJWKS jwk.Set
+		wantReason       string
+	}{
+		{
+			name:             "invalid signature",
+			behavior:         agent.VerificationBehaviourBlock,
+			signingKey:       symmetricJWKFor(t, signingKeyLlamas),
+			verificationJWKS: jwksFromKeys(t, symmetricJWKFor(t, signingKeyAlpacas)),
+			wantReason:       "signature_invalid",
+		},
+		{
+			name:             "job does not match its signed step",
+			job:              jobWithMismatchedStepAndJob,
+			behavior:         agent.VerificationBehaviourBlock,
+			signingKey:       symmetricJWKFor(t, signingKeyLlamas),
+			verificationJWKS: jwksFromKeys(t, symmetricJWKFor(t, signingKeyLlamas)),
+			wantReason:       "job_mismatch",
+		},
+		{
+			name:             "missing signature",
+			behavior:         agent.VerificationBehaviourBlock,
+			verificationJWKS: jwksFromKeys(t, symmetricJWKFor(t, signingKeyLlamas)),
+			wantReason:       "signature_missing",
+		},
+		{
+			name:       "missing verification key",
+			behavior:   agent.VerificationBehaviourBlock,
+			signingKey: symmetricJWKFor(t, signingKeyLlamas),
+			wantReason: "verification_key_missing",
+		},
+		{
+			name:             "invalid signature when only warning",
+			behavior:         agent.VerificationBehaviourWarn,
+			signingKey:       symmetricJWKFor(t, signingKeyLlamas),
+			verificationJWKS: jwksFromKeys(t, symmetricJWKFor(t, signingKeyAlpacas)),
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			job := job
+			if tc.job.ID != "" {
+				job = tc.job
+			}
+			job.Env = maps.Clone(job.Env)
+			job.Env["BUILDKITE_CAPTURE_AGENT_ERRORS"] = "true"
+			if tc.signingKey != nil {
+				if err := signature.SignSteps(t.Context(), pipeline.Steps{&job.Step}, tc.signingKey, defaultRepositoryURL, signature.WithEnv(pipelineUploadEnv)); err != nil {
+					t.Fatalf("signing step: %v", err)
+				}
+			}
+
+			e := createTestAgentEndpoint()
+			server := e.server()
+			defer server.Close()
+			mb := mockBootstrap(t)
+			if tc.wantReason == "" {
+				mb.Expect().Once().AndExitWith(0)
+			} else {
+				mb.Expect().NotCalled()
+			}
+			defer mb.CheckAndClose(t) //nolint:errcheck // bintest logs to t
+
+			err := runJob(t, t.Context(), testRunJobConfig{
+				job:              &job,
+				server:           server,
+				agentCfg:         agent.AgentConfiguration{VerificationFailureBehaviour: tc.behavior},
+				mockBootstrap:    mb,
+				verificationJWKS: tc.verificationJWKS,
+			})
+			if err != nil {
+				t.Fatalf("runJob() error = %v", err)
+			}
+
+			captured := e.capturedErrorsFor(t, job.ID)
+			if tc.wantReason == "" {
+				if len(captured) != 0 {
+					t.Errorf("captured errors = %+v, want none when only warning", captured)
+				}
+				return
+			}
+			if len(captured) != 1 || captured[0].Code != "job_signature_rejected" || captured[0].Context["reason"] != tc.wantReason {
+				t.Errorf("captured errors = %+v, want job_signature_rejected with reason %q", captured, tc.wantReason)
+			}
+		})
+	}
 }
