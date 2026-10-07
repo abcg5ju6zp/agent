@@ -3,11 +3,10 @@ package job
 import (
 	"context"
 	"errors"
-	"strings"
 	"sync"
 	"time"
-	"unicode/utf8"
 
+	"github.com/buildkite/agent/v4/internal/redact"
 	"github.com/buildkite/agent/v4/internal/shell"
 	"github.com/buildkite/agent/v4/jobapi"
 )
@@ -33,9 +32,9 @@ var (
 type gitErrorReportsKey struct{}
 
 // Keep complete output or none: truncating before Job API redaction could leave
-// part of a registered secret unmatched. 4 KiB also leaves room for JSON escaping
-// within the API's 32 KiB request limit.
-const maxGitErrorOutput = 4 << 10
+// part of a registered secret unmatched. Output that fits is reported whole
+// within the agent's captured error detail budget.
+const maxGitErrorOutput = jobapi.MaxCapturedErrorDetail
 
 type gitErrorOutput struct {
 	mu       sync.Mutex
@@ -109,11 +108,9 @@ func captureGitError(ctx context.Context, sh *shell.Shell, err error, output str
 	gitErr.captured = true
 	code, message := classifyGitError(err)
 	if code != "" {
-		if strings.TrimSpace(output) != "" && utf8.ValidString(output) && !strings.ContainsRune(output, 0) {
-			// Preserve complete output, including whitespace, so registered
-			// multi-line secrets can still be matched by the Job API.
-			message = output
-		}
+		// Preserve complete output, including whitespace, so registered
+		// multi-line secrets can still be matched by the Job API.
+		message = jobapi.CapturedErrorMessage(output, message, gitErrorDetails(sh))
 		captureError(ctx, sh, code, message)
 	}
 }
@@ -214,6 +211,21 @@ func captureCheckoutError(ctx context.Context, sh *shell.Shell, err error) {
 	captureError(ctx, sh, code, message)
 }
 
+// gitErrorDetails identifies what the checkout was fetching, so a Git error
+// such as a missing ref can be acted on without the job log.
+func gitErrorDetails(sh *shell.Shell) map[string]any {
+	details := map[string]any{}
+	for key, name := range map[string]string{"repository": "BUILDKITE_REPO", "branch": "BUILDKITE_BRANCH", "commit": "BUILDKITE_COMMIT", "refspec": "BUILDKITE_REFSPEC"} {
+		if value := sh.Env.GetString(name, ""); value != "" && len(value) <= 256 {
+			if key == "repository" {
+				value = redact.URLCredentials(value)
+			}
+			details[key] = value
+		}
+	}
+	return details
+}
+
 func captureError(ctx context.Context, sh *shell.Shell, code, message string) {
 	// Automatic Git reporting is opt-in independently of the general capture API.
 	if sh.Env.GetString("BUILDKITE_CAPTURE_GIT_ERRORS", "") != "true" ||
@@ -222,7 +234,7 @@ func captureError(ctx context.Context, sh *shell.Shell, code, message string) {
 	}
 	// The Local Job API redacts registered secrets before forwarding the report.
 	now := time.Now()
-	report := jobapi.CapturedError{Code: code, Message: message, Timestamp: &now}
+	report := jobapi.CapturedError{Code: code, Message: message, Context: gitErrorDetails(sh), Timestamp: &now}
 	if reports, ok := ctx.Value(gitErrorReportsKey{}).(*gitErrorReports); ok {
 		*reports = append(*reports, report)
 		return

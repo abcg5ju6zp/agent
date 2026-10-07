@@ -21,6 +21,7 @@ import (
 	"github.com/buildkite/agent/v4/internal/replacer"
 	"github.com/buildkite/agent/v4/internal/shell"
 	"github.com/buildkite/agent/v4/internal/socket"
+	"github.com/buildkite/agent/v4/jobapi"
 )
 
 func gitErrorCaptureServer(t *testing.T, enabled bool, status int) (context.Context, *Executor, <-chan api.JobCapturedError) {
@@ -682,8 +683,8 @@ func TestGitErrorOutputCapture(t *testing.T) {
 	}{
 		{"empty", fallback, nil},
 		{"whitespace", fallback, []string{" \n\t"}},
-		{"at limit", strings.Repeat("x", 4095) + "!", []string{strings.Repeat("x", 4095), "!"}},
-		{"over limit", fallback, []string{strings.Repeat("x", 4090), "secret", "-suffix", "fatal: later output"}},
+		{"at limit", strings.Repeat("x", jobapi.MaxCapturedErrorDetail-1) + "!", []string{strings.Repeat("x", jobapi.MaxCapturedErrorDetail-1), "!"}},
+		{"over limit", fallback, []string{strings.Repeat("x", jobapi.MaxCapturedErrorDetail-10), "secret", "-suffix", "fatal: later output"}},
 		{"nul", fallback, []string{"fatal: secret\x00-suffix"}},
 		{"invalid utf8", fallback, []string{"fatal: secret\xff-suffix"}},
 		{"split secret", "fatal: [REDACTED]\n", []string{"fatal: secret", "-suffix\n"}},
@@ -710,5 +711,25 @@ func TestGitErrorOutputCapture(t *testing.T) {
 				t.Fatalf("report = %#v, want unclassified code and message %q", report, tc.want)
 			}
 		})
+	}
+}
+
+func TestGitErrorCaptureIdentifiesTheCheckout(t *testing.T) {
+	t.Parallel()
+	ctx, e, reports := gitErrorCaptureServer(t, true, http.StatusCreated)
+	e.shell.Env.Set("BUILDKITE_REPO", "https://user:token@github.com/acme/widgets.git")
+	e.shell.Env.Set("BUILDKITE_BRANCH", "feature/missing")
+	e.shell.Env.Set("BUILDKITE_COMMIT", "HEAD")
+	e.shell.Env.Remove("BUILDKITE_REFSPEC")
+
+	captureGitError(ctx, e.shell, &gitError{error: errors.New("exit status 128"), Type: gitErrorFetchBadReference}, "fatal: couldn't find remote ref feature/missing\n")
+
+	if len(reports) != 1 {
+		t.Fatalf("reports = %d, want 1", len(reports))
+	}
+	report := <-reports
+	want := map[string]any{"repository": "https://xxxxx@github.com/acme/widgets.git", "branch": "feature/missing", "commit": "HEAD"}
+	if report.Code != "git_ref_not_found" || fmt.Sprint(report.Context) != fmt.Sprint(want) {
+		t.Errorf("report = %q %v, want git_ref_not_found with %v", report.Code, report.Context, want)
 	}
 }
