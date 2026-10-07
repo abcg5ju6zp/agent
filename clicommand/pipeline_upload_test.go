@@ -2,7 +2,11 @@ package clicommand
 
 import (
 	"errors"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
@@ -14,6 +18,7 @@ import (
 	"github.com/buildkite/go-pipeline/ordered"
 	"github.com/buildkite/go-pipeline/warning"
 	"github.com/google/go-cmp/cmp"
+	"github.com/urfave/cli/v3"
 )
 
 func TestSearchForSecrets(t *testing.T) {
@@ -1028,5 +1033,69 @@ func TestIfChangedApplicator_WithChangedFilesPath(t *testing.T) {
 	ica.apply(l, steps)
 	if diff := cmp.Diff(steps, want); diff != "" {
 		t.Errorf("after ica.apply(l, steps) (-got, +want):\n%s", diff)
+	}
+}
+
+func TestPipelineUploadFailuresAreCaptured(t *testing.T) {
+	agentAPI := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnprocessableEntity)
+		_, _ = w.Write([]byte(`{"message":"Step 1 is missing a command"}`))
+	}))
+	t.Cleanup(agentAPI.Close)
+
+	for _, test := range []struct {
+		name, pipeline, stage, message string
+		args                           []string
+	}{
+		{
+			name:     "parse",
+			pipeline: "steps:\n  - command: [unterminated\n",
+			stage:    "parse",
+			message:  `pipeline parsing of "pipeline.yml" failed`,
+		},
+		{
+			name:     "secret detection",
+			pipeline: "steps:\n  - command: echo $UPLOAD_TEST_SECRET\n",
+			stage:    "secret_detection",
+			message:  "UPLOAD_TEST_SECRET",
+			args:     []string{"--redacted-vars", "UPLOAD_TEST_SECRET"},
+		},
+		{
+			name:     "upload",
+			pipeline: "steps:\n  - command: echo hello\n",
+			stage:    "upload",
+			message:  "Step 1 is missing a command",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			reports := startAgentErrorTestServer(t)
+			t.Setenv("UPLOAD_TEST_SECRET", "a-very-secret-value")
+			path := filepath.Join(t.TempDir(), "pipeline.yml")
+			if err := os.WriteFile(path, []byte(test.pipeline), 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			cmd := *PipelineUploadCommand
+			app := &cli.Command{Name: "buildkite-agent", Commands: []*cli.Command{&cmd}, Writer: io.Discard, ErrWriter: io.Discard}
+			args := append([]string{
+				"buildkite-agent", "upload",
+				"--endpoint", agentAPI.URL, "--agent-access-token", "job-token", "--job", "job-id",
+			}, test.args...)
+			if err := app.Run(t.Context(), append(args, path)); err == nil {
+				t.Fatal("pipeline upload succeeded, want failure")
+			}
+
+			if len(*reports) != 1 {
+				t.Fatalf("reports = %+v, want one", *reports)
+			}
+			report := (*reports)[0]
+			if report.Code != "pipeline_upload_failed" || report.Context["stage"] != test.stage {
+				t.Errorf("report = %+v, want pipeline_upload_failed at stage %q", report, test.stage)
+			}
+			if !strings.Contains(report.Message, test.message) || strings.Contains(report.Message, "a-very-secret-value") {
+				t.Errorf("message = %q, want it to contain %q and no secret value", report.Message, test.message)
+			}
+		})
 	}
 }

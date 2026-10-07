@@ -28,6 +28,7 @@ import (
 	"github.com/buildkite/agent/v4/internal/redact"
 	"github.com/buildkite/agent/v4/internal/replacer"
 	"github.com/buildkite/agent/v4/internal/stdin"
+	"github.com/buildkite/agent/v4/jobapi"
 	"github.com/buildkite/agent/v4/logger"
 	"github.com/buildkite/go-pipeline"
 	"github.com/buildkite/go-pipeline/jwkutil"
@@ -197,11 +198,20 @@ var PipelineUploadCommand = &cli.Command{
 		},
 		RedactedVars,
 	}),
-	Action: func(ctx context.Context, c *cli.Command) error {
+	Action: func(ctx context.Context, c *cli.Command) (err error) {
 		ctx, cfg, l, _, done := setupLoggerAndConfig[PipelineUploadConfig](ctx, c)
 		defer done()
 		ctx, span := otel.Tracer("buildkite-agent").Start(ctx, "pipeline-upload")
 		defer span.End()
+
+		// stage records how far the upload got, and failure the underlying
+		// cause when the returned error is a silent exit.
+		stage, failure := "read", error(nil)
+		defer func() {
+			if err != nil {
+				capturePipelineUploadError(ctx, l, stage, cmp.Or(failure, err))
+			}
+		}()
 
 		// Find the pipeline either from STDIN or the non-flag arguments
 		type input struct {
@@ -341,10 +351,12 @@ var PipelineUploadCommand = &cli.Command{
 			// For each pipeline in the input (could be multiple)...
 			count := 1
 			for result, err := range cfg.parseAndInterpolate(ctx, input.name, input.file, environ) {
+				stage = "parse"
 				if abort := cfg.handleParseError(l, input.name, err); abort != nil {
 					return abort
 				}
 
+				stage = "secret_detection"
 				if len(cfg.RedactedVars) > 0 {
 					// Secret detection uses the original environment, since
 					// Interpolate merges the pipeline's env block into `environ`.
@@ -354,6 +366,7 @@ var PipelineUploadCommand = &cli.Command{
 					}
 				}
 
+				stage = "signing"
 				var key signature.Key
 
 				switch {
@@ -414,6 +427,7 @@ var PipelineUploadCommand = &cli.Command{
 					continue
 				}
 
+				stage = "upload"
 				// Check we have a job id set if not in dry run
 				if cfg.Job == "" {
 					return errors.New("missing job parameter; this is usually set in the environment for a Buildkite job via BUILDKITE_JOB_ID")
@@ -436,6 +450,7 @@ var PipelineUploadCommand = &cli.Command{
 				}
 				if err := uploader.Upload(ctx, l); err != nil {
 					l.Errorf("Couldn't upload: %v", err)
+					failure = err
 					return NewSilentExitError(1)
 				}
 
@@ -449,6 +464,22 @@ var PipelineUploadCommand = &cli.Command{
 }
 
 // resolveCommit resolves and replaces BUILDKITE_COMMIT with the resolved value.
+// capturePipelineUploadError reports why a pipeline upload failed. Parse and
+// API errors explain what to fix, so they are reported when they fit.
+func capturePipelineUploadError(ctx context.Context, l logger.Logger, stage string, err error) {
+	details := map[string]any{"stage": stage}
+	fix := map[string]string{
+		"read":             "Check that the pipeline file exists and is not empty.",
+		"parse":            "Fix the pipeline definition; line numbers refer to the uploaded input.",
+		"secret_detection": "Write the variable as $$VAR so it is interpolated when each job runs, or stop interpolating secrets into the pipeline.",
+		"signing":          "Check the signing key options passed to `buildkite-agent pipeline upload`.",
+		"upload":           "Fix the pipeline definition so that Buildkite accepts it.",
+	}[stage]
+	fallback := fmt.Sprintf("`buildkite-agent pipeline upload` failed during the %s stage. %s", strings.ReplaceAll(stage, "_", " "), fix)
+	message := fmt.Sprintf("`buildkite-agent pipeline upload` failed: %v. %s", err, fix)
+	captureAgentError(ctx, l, "pipeline_upload_failed", jobapi.CapturedErrorMessage(message, fallback, details), details)
+}
+
 func resolveCommit(l logger.Logger, environ *env.Environment) {
 	commitRef, has := environ.Get("BUILDKITE_COMMIT")
 	if !has {
