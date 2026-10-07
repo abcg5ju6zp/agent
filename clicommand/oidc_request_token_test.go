@@ -219,3 +219,28 @@ func TestOIDCRequestTokenRetriesUndecodableResponse(t *testing.T) {
 		t.Errorf("server received %d requests, want %d", got, want)
 	}
 }
+
+func TestOIDCRequestTokenFailureIsCaptured(t *testing.T) {
+	reports := startAgentErrorTestServer(t)
+	server := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		rw.Header().Set("Content-Type", "application/json")
+		rw.WriteHeader(http.StatusForbidden)
+		_, _ = fmt.Fprint(rw, `{"message":"audience not allowed"}`)
+	}))
+	defer server.Close()
+
+	if _, err := runOIDCRequestTokenCommand(t, server.URL, "--audience", "sts.example.com"); err == nil {
+		t.Fatal("runOIDCRequestTokenCommand() error = nil, want refusal")
+	}
+
+	if len(*reports) != 1 {
+		t.Fatalf("reports = %+v, want one", *reports)
+	}
+	report := (*reports)[0]
+	if report.Code != "oidc_token_request_failed" || !strings.Contains(report.Message, "audience not allowed") {
+		t.Errorf("report = %q %q, want oidc_token_request_failed with the API's reason", report.Code, report.Message)
+	}
+	if report.Context["refused"] != true || report.Context["audience"] != "sts.example.com" {
+		t.Errorf("context = %#v, want refused audience", report.Context)
+	}
+}

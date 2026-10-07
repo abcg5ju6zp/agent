@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -207,4 +208,30 @@ func TestSecretGet(t *testing.T) {
 			}
 		}
 	})
+}
+
+func TestSecretGetFailureIsCaptured(t *testing.T) {
+	reports := startAgentErrorTestServer(t)
+	server := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		rw.Header().Set("Content-Type", "application/json")
+		rw.WriteHeader(http.StatusNotFound)
+		_, _ = fmt.Fprint(rw, `{"message":"secret not found"}`)
+	}))
+	defer server.Close()
+
+	err := secretGet(t.Context(), baseSecretGetConfig(server.URL, []string{"deploy_key"}, "default"), io.Discard, logger.NewBuffer())
+	if err == nil {
+		t.Fatal("secretGet() error = nil, want fetch failure")
+	}
+
+	if len(*reports) != 1 {
+		t.Fatalf("reports = %+v, want one", *reports)
+	}
+	report := (*reports)[0]
+	if report.Code != "secrets_fetch_failed" || !strings.Contains(report.Message, "- deploy_key: 404 Not Found: secret not found") {
+		t.Errorf("report = %q %q, want secrets_fetch_failed with the key's reason", report.Code, report.Message)
+	}
+	if diff := cmp.Diff(map[string]any{"failed_keys": []any{"deploy_key"}, "command": "buildkite-agent secret get"}, report.Context); diff != "" {
+		t.Errorf("context diff (-want +got):\n%s", diff)
+	}
 }

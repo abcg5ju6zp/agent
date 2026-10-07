@@ -176,6 +176,16 @@ var OIDCRequestTokenCommand = &cli.Command{
 			} else {
 				err = fmt.Errorf("could not obtain OIDC token for default audience: %w", err)
 			}
+			details := map[string]any{"refused": oidcTokenRefused(err)}
+			if cfg.Audience != "" {
+				details["audience"] = cfg.Audience
+			}
+			fix := "The request may succeed if retried."
+			if details["refused"] == true {
+				fix = "Buildkite refused the request, so check the audience, claims, and lifetime passed to `buildkite-agent oidc request-token`."
+			}
+			captureAgentError(ctx, l, "oidc_token_request_failed",
+				jobapi.CapturedErrorMessage(err.Error()+". "+fix, "Could not obtain an OIDC token. "+fix, details), details)
 			if oidcTokenRefused(err) {
 				return NewExitError(OIDCTokenRefusedExitStatus, err)
 			}
