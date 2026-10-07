@@ -7,6 +7,7 @@ import (
 
 	"github.com/buildkite/agent/v4/api"
 	"github.com/buildkite/agent/v4/internal/cache"
+	"github.com/buildkite/agent/v4/jobapi"
 	"github.com/urfave/cli/v3"
 	"go.opentelemetry.io/otel"
 )
@@ -125,6 +126,12 @@ var CacheRestoreCommand = &cli.Command{
 		}
 
 		// Perform cache restore (logging happens inside)
-		return cache.RunRestore(ctx, l, apiClient, cacheCfg)
+		if err := cache.RunRestore(ctx, l, apiClient, cacheCfg); err != nil {
+			details := map[string]any{"names": cfg.Names, "registry": cfg.Registry}
+			summary := fmt.Sprintf("Failed to restore caches %v from registry %q", cfg.Names, cfg.Registry)
+			captureAgentError(ctx, l, "cache_restore_failed", jobapi.CapturedErrorMessage(summary+": "+storageErrorText(err), summary+".", details), details)
+			return err
+		}
+		return nil
 	},
 }
