@@ -470,12 +470,19 @@ func (e *Executor) executeHook(ctx context.Context, hookCfg HookConfig) (retErr 
 	}
 	hookName += " " + hookCfg.Name
 
+	// A command hook's failure is the command's failure, which CommandPhase
+	// captures instead.
+	if hookCfg.Name != "command" {
+		defer func() { e.captureHookError(ctx, hookCfg, hookName, retErr) }()
+	}
+
 	if !osutil.FileExists(hookCfg.Path) {
 		if e.Debug {
 			e.shell.Commentf("Skipping %s hook, no script at \"%s\"", hookName, hookCfg.Path)
 		}
 		return nil
 	}
+	e.outputTail.reset()
 
 	e.shell.Headerf("Running %s hook", hookName)
 
@@ -910,6 +917,16 @@ func (e *Executor) executeLocalHook(ctx context.Context, name string) error {
 	}
 
 	if !localHooksEnabled {
+		// Say which setting disabled local hooks, since only the step's
+		// environment can be changed from the repository.
+		disabledBy, fix := "BUILDKITE_NO_LOCAL_HOOKS", "Remove BUILDKITE_NO_LOCAL_HOOKS from the job's environment, or remove the hook from the repository."
+		if !e.LocalHooksEnabled {
+			disabledBy, fix = "the agent's --no-local-hooks option", "Remove the hook from the repository, or run the step on agents that allow local hooks."
+		}
+		relPath, _ := filepath.Rel(e.shell.Env.GetString("BUILDKITE_BUILD_CHECKOUT_PATH", ""), localHookPath)
+		captureJobError(ctx, e.shell, "local_hook_refused",
+			fmt.Sprintf("The repository has a %s hook at %s, but %s disables local hooks, so the job failed. %s", name, filepath.ToSlash(relPath), disabledBy, fix),
+			map[string]any{"hook": name, "path": filepath.ToSlash(relPath), "disabled_by": disabledBy})
 		return fmt.Errorf("refusing to run %s, local hooks are disabled", localHookPath)
 	}
 
