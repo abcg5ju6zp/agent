@@ -58,9 +58,14 @@ func TestCapturedErrorRedactionResponse(t *testing.T) {
 			wantError: "redacting captured error: code must be a nonblank string of at most 255 bytes without NUL",
 		},
 		{
-			name:      "redaction expands report beyond body limit",
-			body:      `{"code":"x","message":"` + strings.Repeat("q", 3300) + `"}`,
-			wantError: "redacting captured error: captured error exceeds 32768 bytes after redaction",
+			name:      "redaction expands message beyond 2 KiB",
+			body:      `{"code":"x","message":"` + strings.Repeat("q", 205) + `"}`,
+			wantError: "redacting captured error: message exceeds 2048 bytes; shorten the message",
+		},
+		{
+			name:      "redaction expands context beyond 2 KiB",
+			body:      `{"code":"x","message":"Failed","context":{"detail":"` + strings.Repeat("q", 204) + `"}}`,
+			wantError: "redacting captured error: context exceeds 2048 bytes after JSON encoding; reduce the context",
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -197,7 +202,7 @@ func TestCapturedErrorRejectsMalformedAndUnauthenticatedRequests(t *testing.T) {
 		{name: "UTC year underflow", body: `{"code":"x","message":"diagnostic","timestamp":"0001-01-01T00:00:00+01:00"}`, token: token, want: http.StatusBadRequest},
 		{name: "UTC year overflow", body: `{"code":"x","message":"diagnostic","timestamp":"9999-12-31T23:59:59-01:00"}`, token: token, want: http.StatusBadRequest},
 		{name: "future timestamp", body: `{"code":"x","message":"diagnostic","timestamp":"9999-12-31T23:59:59Z"}`, token: token, want: http.StatusCreated},
-		{name: "long message", body: `{"code":"x","message":"` + strings.Repeat("x", 4097) + `"}`, token: token, want: http.StatusCreated},
+		{name: "long message", body: `{"code":"x","message":"` + strings.Repeat("x", 4097) + `"}`, token: token, want: http.StatusBadRequest},
 		{name: "non-object context", body: `{"code":"x","message":"diagnostic","context":[]}`, token: token, want: http.StatusBadRequest},
 		{name: "oversized body", body: `{"code":"x","message":"diagnostic","context":{"large":"` + strings.Repeat("x", 32<<10) + `"}}`, token: token, want: http.StatusRequestEntityTooLarge},
 		{name: "missing message", body: `{"code":"x"}`, token: token, want: http.StatusBadRequest},
@@ -227,6 +232,80 @@ func TestCapturedErrorRejectsMalformedAndUnauthenticatedRequests(t *testing.T) {
 	}
 }
 
+func TestCapturedErrorFieldLimits(t *testing.T) {
+	t.Parallel()
+
+	reported := make(chan *jobapi.CapturedError, 1)
+	srv, token, err := testServer(t, testEnviron(), replacer.NewMux(), jobapi.WithCapturedErrorReporter(func(_ context.Context, payload *jobapi.CapturedError) error {
+		reported <- payload
+		return nil
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := srv.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = srv.Stop() })
+
+	message := strings.Repeat("é", 1024)
+	// The JSON object adds 13 bytes; each newline and é pair adds four.
+	detail := strings.Repeat("\né", 508) + "éx"
+	for _, test := range []struct {
+		name, message, detail, wantError string
+	}{
+		{"both fields at 2 KiB", message, detail, ""},
+		{"message limit counts text, not JSON escapes", strings.Repeat("\n", 2047) + "x", "", ""},
+		{"message one byte over", message + "x", detail, "message exceeds 2048 bytes; shorten the message"},
+		{"context one byte over", message, detail + "x", "context exceeds 2048 bytes after JSON encoding; reduce the context"},
+		{"JSON escaping counts towards context size", "Failed", strings.Repeat("<", 340), "context exceeds 2048 bytes after JSON encoding; reduce the context"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			body, err := json.Marshal(jobapi.CapturedError{Code: "x", Message: test.message, Context: map[string]any{"detail": test.detail}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			req, err := http.NewRequest(http.MethodPost, "http://job/api/current-job/v0/errors", bytes.NewReader(body))
+			if err != nil {
+				t.Fatal(err)
+			}
+			req.Header.Set("Authorization", "Bearer "+token)
+			resp, err := testSocketClient(srv.SocketPath).Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = resp.Body.Close() }()
+			if test.wantError != "" {
+				if resp.StatusCode != http.StatusBadRequest {
+					t.Errorf("status = %d, want 400", resp.StatusCode)
+				}
+				var response socket.ErrorResponse
+				if err := json.NewDecoder(resp.Body).Decode(&response); err != nil {
+					t.Fatal(err)
+				}
+				if response.Error != test.wantError {
+					t.Errorf("error = %q, want %q", response.Error, test.wantError)
+				}
+			} else if resp.StatusCode != http.StatusCreated {
+				t.Fatalf("status = %d, want 201", resp.StatusCode)
+			}
+			select {
+			case payload := <-reported:
+				if test.wantError != "" {
+					t.Fatal("oversized fields were forwarded")
+				}
+				if payload.Message != test.message || payload.Context["detail"] != test.detail {
+					t.Error("fields within the limit were changed")
+				}
+			default:
+				if test.wantError == "" {
+					t.Error("fields within the limit were not forwarded")
+				}
+			}
+		})
+	}
+}
+
 func TestCapturedErrorBodyLimit(t *testing.T) {
 	t.Parallel()
 
@@ -243,9 +322,7 @@ func TestCapturedErrorBodyLimit(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = srv.Stop() })
 
-	// A 20 KiB message must be forwarded unchanged. Multibyte text makes the
-	// byte-versus-character limit observable.
-	message := strings.Repeat("é", 10<<10)
+	message := strings.Repeat("é", 1024)
 	body := `{"code":"x","message":"` + message + `","context":{"detail":"kept"}}`
 	for _, test := range []struct {
 		name string

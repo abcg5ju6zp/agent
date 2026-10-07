@@ -20,6 +20,8 @@ import (
 // adds a timestamp and idempotency key.
 const MaxCapturedErrorBody = 32 << 10
 
+const maxCapturedErrorFieldSize = 2 << 10
+
 // UnmarshalJSON distinguishes omitted context from explicit null and preserves
 // JSON numbers on both the CLI and parent sides of the local transport.
 func (e *CapturedError) UnmarshalJSON(data []byte) error {
@@ -217,6 +219,16 @@ func validateCapturedError(e *CapturedError) error {
 	}
 	if strings.TrimSpace(e.Message) == "" || strings.ContainsRune(e.Message, 0) {
 		return errors.New("message must be a nonblank string without NUL")
+	}
+	if len(e.Message) > maxCapturedErrorFieldSize {
+		return fmt.Errorf("message exceeds %d bytes; shorten the message", maxCapturedErrorFieldSize)
+	}
+	context, err := json.Marshal(e.Context)
+	if err != nil {
+		return fmt.Errorf("encoding context: %w", err)
+	}
+	if len(context) > maxCapturedErrorFieldSize {
+		return fmt.Errorf("context exceeds %d bytes after JSON encoding; reduce the context", maxCapturedErrorFieldSize)
 	}
 	if e.IdempotencyKey != "" {
 		return errors.New("idempotency_key is assigned by the parent agent and must be omitted")

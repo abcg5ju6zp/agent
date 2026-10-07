@@ -146,6 +146,28 @@ func TestJobCaptureErrorRejectsInvalidArgumentsBeforeTransport(t *testing.T) {
 	}
 }
 
+func TestJobCaptureErrorReportsOversizedFields(t *testing.T) {
+	startCaptureErrorTestServer(t, func(context.Context, *jobapi.CapturedError) error {
+		t.Error("oversized fields must not be reported")
+		return nil
+	})
+	t.Setenv("BUILDKITE_AGENT_JOB_CAPTURE_ERROR_CONTEXT", "")
+	for _, test := range []struct {
+		name, message, input, want string
+	}{
+		{"message", strings.Repeat("é", 1024) + "x", `{}`, "message exceeds 2048 bytes; shorten the message"},
+		{"context", "Failed", `{"detail":"` + strings.Repeat("x", 2036) + `"}`, "context exceeds 2048 bytes after JSON encoding; reduce the context"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			app := captureErrorTestApp()
+			err := app.Run(t.Context(), []string{"buildkite-agent", "capture-error", "x", "--message", test.message, "--context", test.input})
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("capture-error error = %v, want %q", err, test.want)
+			}
+		})
+	}
+}
+
 func TestJobCaptureErrorDoesNotFallbackWithoutLocalJobAPI(t *testing.T) {
 	t.Setenv("BUILDKITE_AGENT_JOB_API_SOCKET", "")
 	app := captureErrorTestApp()
