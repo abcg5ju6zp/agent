@@ -36,19 +36,20 @@ reporting them. This does not automatically detect other sensitive information.
 Redacted numbers become strings. Reports are rejected if redaction causes
 duplicate context keys, an invalid error code, or an oversized payload.
 
-Code, message and context share a 1536-byte budget, checked by the parent agent
-before and after redaction. Code and message count as UTF-8 bytes; context
-counts as compact JSON, including escapes. Omitted context counts as {}.
-Oversized reports are rejected, not shortened. Keep the error brief and put
-detailed output in an annotation or artifact.
+Keep reports brief: code, message and context must fit within 1536 bytes
+combined. Larger reports return an error; they are not shortened automatically.
+Put detailed output in an annotation or artifact instead.
 
-This experimental budget leaves room for identifiers and storage overhead,
-aiming for rows around 2 KiB. It is not a physical row-size or no-TOAST guarantee.
+Code and message are measured in UTF-8 bytes, not characters. Context is measured
+as compact JSON (without formatting whitespace), including keys, quotes and
+escaped characters. If you leave out --context, the empty object {} uses 2 bytes.
 
-The whole report is still limited to 32 KiB, including JSON encoding.
-Raw context input is also limited to 32 KiB before parsing.
-Buildkite checks the budget independently. Server JSON normalization can change
-the size near the limit, so a report accepted by the agent may still be rejected.
+The agent running the job checks the size before and after hiding secrets.
+The Buildkite server checks it too. The server may encode context differently,
+so a report close to the limit can still be rejected there.
+
+There is also a separate 32 KiB limit on the whole JSON request and on raw
+--context input. These input limits do not replace the 1536-byte combined limit.
 
 Note: This feature is currently in development and subject to change. It is not
 yet available to all customers.`
