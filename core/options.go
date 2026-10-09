@@ -10,6 +10,10 @@ type controllerConfig struct {
 	logger         logger.Logger
 	retrySleepFunc func(time.Duration)
 
+	// Directory used to persist recoverable per-job delivery sessions. Empty
+	// means use the platform default cache directory.
+	jobStateDir string
+
 	// Controller creation options - ignored for more specific functions.
 	endpoint          string
 	userAgent         string
@@ -18,6 +22,22 @@ type controllerConfig struct {
 	priority          string
 	scriptEvalEnabled bool
 }
+
+// jobControllerOptions configures a JobController's persistent session.
+type jobControllerOptions struct {
+	// stateDir is the directory in which per-job session state and chunk
+	// write-ahead logs are stored. Empty means use the platform default cache
+	// directory.
+	stateDir string
+
+	// staleLockTimeout bounds how long a new controller waits for a live
+	// session owner to release its lock before fencing the owner and
+	// continuing recovery without the lock.
+	staleLockTimeout time.Duration
+}
+
+// JobControllerOption is a functional option for a job controller.
+type JobControllerOption func(*jobControllerOptions)
 
 // ControllerOption is a functional option for setting optional behaviour.
 type ControllerOption func(*controllerConfig)
@@ -82,5 +102,34 @@ func WithPriority(priority string) ControllerOption {
 func WithScriptEvalEnabled(enabled bool) ControllerOption {
 	return func(c *controllerConfig) {
 		c.scriptEvalEnabled = enabled
+	}
+}
+
+// WithJobStateDir sets the directory used to persist recoverable per-job
+// delivery sessions (chunk delivery state, write-ahead logs, and start/finish
+// state). Defaults to a "buildkite-agent/job-sessions" directory under the
+// platform user cache directory.
+func WithJobStateDir(dir string) ControllerOption {
+	return func(c *controllerConfig) {
+		c.jobStateDir = dir
+	}
+}
+
+// WithStateDir sets the directory used to persist this job controller's
+// recoverable delivery session. Defaults to a "buildkite-agent/job-sessions"
+// directory under the platform user cache directory.
+func WithStateDir(dir string) JobControllerOption {
+	return func(o *jobControllerOptions) {
+		o.stateDir = dir
+	}
+}
+
+// WithStaleLockTimeout sets how long a newly created job controller waits for a
+// live session owner to release its lock before fencing the owner and
+// continuing recovery without the lock. Defaults to 10s. Mainly useful for
+// unit tests.
+func WithStaleLockTimeout(d time.Duration) JobControllerOption {
+	return func(o *jobControllerOptions) {
+		o.staleLockTimeout = d
 	}
 }

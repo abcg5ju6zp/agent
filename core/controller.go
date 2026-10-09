@@ -25,6 +25,7 @@ func NewController(ctx context.Context, regToken, agentName string, tags []strin
 	cfg := &controllerConfig{
 		logger:            logger.Discard,
 		retrySleepFunc:    nil,
+		jobStateDir:       "",
 		endpoint:          "https://agent-edge.buildkite.com/v3",
 		userAgent:         version.UserAgent(),
 		debugHTTP:         false,
@@ -85,7 +86,9 @@ func (a *Controller) AcquireJob(ctx context.Context, jobID string) (*api.Job, er
 	return a.client.AcquireJob(ctx, jobID)
 }
 
-// NewJobController creates a new job controller for a job.
-func (a *Controller) NewJobController(job *api.Job) *JobController {
-	return NewJobController(a.client, job)
+// NewJobController creates a new job controller for a job. Its recoverable
+// delivery session is persisted under the controller's configured job state
+// directory (see [WithJobStateDir]).
+func (a *Controller) NewJobController(job *api.Job) (*JobController, error) {
+	return NewJobControllerWithOptions(a.client, job, WithStateDir(a.config.jobStateDir))
 }
