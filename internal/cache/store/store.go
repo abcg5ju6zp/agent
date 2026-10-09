@@ -19,6 +19,9 @@ type TransferInfo struct {
 	Duration         time.Duration
 	PartCount        int // number of parts used in multipart transfer (0 if not multipart)
 	Concurrency      int // number of concurrent uploads/downloads used
+	// Resumed reports the upload completed an incomplete multipart upload a
+	// previous save left behind, reusing its already-uploaded parts.
+	Resumed bool
 }
 
 func IsValidStore(storeType string) bool {

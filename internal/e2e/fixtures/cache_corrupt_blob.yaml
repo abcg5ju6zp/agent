@@ -1,0 +1,70 @@
+# Cache corrupt/old-blob recovery: a committed registry entry whose backing
+# blob has been replaced with garbage (as happens with a partial/corrupted
+# upload or an unreadable old object) must restore as a clean miss — not an
+# error, and not extract anything — and invalidate the stale entry. A later
+# save then uploads fresh content and restore hits.
+#
+# Per-build prefix keeps runs isolated; the registry entry is shared across
+# the steps while its blob is overwritten between save and restore.
+env:
+  CACHE_CONFIG_B64: "{{ fixture "includes/cache_config.yml" | b64enc }}"
+agents:
+  queue: {{ .queue }}
+steps:
+  - key: save
+    plugins: &assume_role
+      - aws-assume-role-with-web-identity#v1.4.0:
+          role-arn: arn:aws:iam/172840064832:role/pipeline-agent-e2e-testing-buildkite-agent-e2e
+          session-tags:
+            - organization_slug
+            - organization_id
+            - pipeline_slug
+    commands:
+      - export BUILDKITE_AGENT_CACHE_STORE_URL="s3://buildkite-agent-e2e-tests-shared/cache-e2e-test/$${BUILDKITE_BUILD_ID}/corrupt?region=us-west-2"
+      - mkdir -p cache-src
+      - echo "original contents" > cache-src/file.txt
+      - echo "$$CACHE_CONFIG_B64" | base64 -d > cache.yml
+      - {{ .buildkite_agent_binary }} cache save --cache-config-file cache.yml
+
+  - key: corrupt_restore
+    depends_on: save
+    plugins: *assume_role
+    commands:
+      - |
+        set -euo pipefail
+        PREFIX="cache-e2e-test/$${BUILDKITE_BUILD_ID}/corrupt"
+        export BUILDKITE_AGENT_CACHE_STORE_URL="s3://buildkite-agent-e2e-tests-shared/$${PREFIX}?region=us-west-2"
+        echo "$$CACHE_CONFIG_B64" | base64 -d > cache.yml
+
+        # Replace the committed entry's backing blob with garbage.
+        aws s3api list-objects-v2 \
+          --bucket buildkite-agent-e2e-tests-shared \
+          --prefix "$${PREFIX}/" --region us-west-2 > objs.json
+        KEY=$$(grep -o '"Key": "[^"]*"' objs.json | sed 's/"Key": "//;s/"//')
+        if [ -z "$$KEY" ]; then echo "could not find saved blob"; exit 1; fi
+        echo "this is not a cache archive" > garbage.txt
+        # No query string in the S3 URI: the AWS CLI does not parse one and
+        # would otherwise make it part of the object key.
+        aws s3 cp garbage.txt "s3://buildkite-agent-e2e-tests-shared/$${KEY}" --region us-west-2
+
+        # Restore must be a clean miss (digest mismatch), exit 0, and not
+        # create the target.
+        {{ .buildkite_agent_binary }} cache restore --cache-config-file cache.yml
+        if [ -e cache-src/file.txt ]; then
+          echo "expected a clean miss, but cache-src/file.txt appeared"
+          exit 1
+        fi
+
+  - key: resave
+    depends_on: corrupt_restore
+    plugins: *assume_role
+    commands:
+      - export BUILDKITE_AGENT_CACHE_STORE_URL="s3://buildkite-agent-e2e-tests-shared/cache-e2e-test/$${BUILDKITE_BUILD_ID}/corrupt?region=us-west-2"
+      - mkdir -p cache-src
+      - echo "healed contents" > cache-src/file.txt
+      - echo "$$CACHE_CONFIG_B64" | base64 -d > cache.yml
+      # The stale entry was invalidated, so this save uploads fresh.
+      - {{ .buildkite_agent_binary }} cache save --cache-config-file cache.yml
+      - rm -rf cache-src
+      - {{ .buildkite_agent_binary }} cache restore --cache-config-file cache.yml
+      - "[ $$(cat cache-src/file.txt) = 'healed contents' ]"

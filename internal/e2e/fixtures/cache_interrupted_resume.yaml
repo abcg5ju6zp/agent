@@ -1,0 +1,62 @@
+# Cache interrupted-upload resume: a save killed mid-upload (as happens on an
+# agent restart / network loss) leaves an in-progress multipart upload that no
+# committed entry references. The next save must discover it, reuse the parts
+# already uploaded, complete and commit; only then must restore hit.
+#
+# We interrupt the save with `timeout` and confirm via the AWS API that an
+# in-progress multipart upload was actually staged (looping a few times in case
+# a kill lands while the archive is still being built). The second save's log is
+# then required to show the resume, and a final delete+restore must round-trip
+# the exact bytes.
+env:
+  CACHE_CONFIG_B64: "{{ fixture "includes/cache_config.yml" | b64enc }}"
+agents:
+  queue: {{ .queue }}
+steps:
+  - key: interrupted_resume
+    plugins:
+      - aws-assume-role-with-web-identity#v1.4.0:
+          role-arn: arn:aws:iam/172840064832:role/pipeline-agent-e2e-testing-buildkite-agent-e2e
+          session-tags:
+            - organization_slug
+            - organization_id
+            - pipeline_slug
+    commands:
+      - |
+        set -euo pipefail
+        PREFIX="cache-e2e-test/$${BUILDKITE_BUILD_ID}/int"
+        export BUILDKITE_AGENT_CACHE_STORE_URL="s3://buildkite-agent-e2e-tests-shared/$${PREFIX}?region=us-west-2"
+
+        # 500 MiB of random (incompressible) bytes: large enough that a save
+        # cannot finish within the interruption window.
+        mkdir -p cache-src
+        dd if=/dev/urandom of=cache-src/blob bs=1m count=500 status=none
+        shasum -a 256 cache-src/blob > blob.sha
+        echo "$$CACHE_CONFIG_B64" | base64 -d > cache.yml
+
+        # Interrupt saves until an in-progress multipart upload is observable.
+        staged=0
+        for attempt in 1 2 3; do
+          timeout 12 {{ .buildkite_agent_binary }} cache save --cache-config-file cache.yml || true
+          aws s3api list-multipart-uploads \
+            --bucket buildkite-agent-e2e-tests-shared \
+            --prefix "$${PREFIX}/" --region us-west-2 > mpu.json || true
+          if grep -q '"UploadId"' mpu.json; then
+            staged=1
+            break
+          fi
+        done
+        if [ "$staged" != "1" ]; then
+          echo "expected an in-progress multipart upload to be staged after interruption"
+          exit 1
+        fi
+
+        # Resume or abandon: this save must discover the partial upload and
+        # either resume and complete it, or abort it and upload again.
+        {{ .buildkite_agent_binary }} cache save --cache-config-file cache.yml 2>&1 | tee resume-save.log
+        grep -Eq "resumed an incomplete multipart upload|aborted an incomplete multipart upload that could not be resumed" resume-save.log
+
+        # Only the now-complete entry is restorable; the bytes must round-trip.
+        rm -rf cache-src
+        {{ .buildkite_agent_binary }} cache restore --cache-config-file cache.yml
+        shasum -a 256 -c blob.sha

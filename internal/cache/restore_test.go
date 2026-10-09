@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -118,7 +119,7 @@ func TestRunRestore_Diagnostics(t *testing.T) {
 			name:     "hit without downloadable blob",
 			status:   http.StatusOK,
 			attempts: `[{"cache_key":["npm","v1","current"],"scopes":{"pipeline":"ci"},"outcome":"hit"}]`,
-			want:     "Restoring cache: npm\n  npm-v1-current · pipeline=ci → hit\nFailed to restore cache: failed to download cache: cache entry has no blobs to download; continuing without failing the build\n",
+			want:     "Restoring cache: npm\n  npm-v1-current · pipeline=ci → hit\nCache miss (stale entry structure, entry may already have been removed or replaced by a newer save)\n",
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -126,7 +127,14 @@ func TestRunRestore_Diagnostics(t *testing.T) {
 				t.Fatal(err)
 			}
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				if r.URL.Path != "/cache_registries/~/retrieve" {
+				switch r.URL.Path {
+				case "/cache_registries/~/retrieve":
+				case "/cache_registries/~/expire":
+					// Stale-structure misses best-effort invalidate; acknowledge.
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = io.WriteString(w, `{"existed":true}`)
+					return
+				default:
 					t.Errorf("unexpected API path: %s", r.URL.Path)
 					http.NotFound(w, r)
 					return

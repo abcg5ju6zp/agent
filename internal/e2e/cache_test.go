@@ -93,3 +93,39 @@ func TestCacheMissingBlobReupload(t *testing.T) {
 		t.Errorf("Build state = %q, want %q", got, want)
 	}
 }
+
+// Test the interrupted-upload resume path: a save killed mid-upload leaves an
+// in-progress multipart upload; the next save resumes it (reusing uploaded
+// parts), commits, and restore round-trips the exact bytes.
+func TestCacheInterruptedResume(t *testing.T) {
+	t.Parallel()
+
+	ctx := t.Context()
+
+	tc := newTestCase(t, "cache_interrupted_resume.yaml")
+
+	tc.startAgent()
+	build := tc.triggerBuild()
+	state := tc.waitForBuild(ctx, build)
+	if got, want := state, "passed"; got != want {
+		t.Errorf("Build state = %q, want %q", got, want)
+	}
+}
+
+// Test recovery when a committed entry's backing blob has been replaced with
+// garbage: restore is a clean miss and invalidates, a fresh save uploads and
+// the final restore hits with the new content.
+func TestCacheCorruptBlobHeal(t *testing.T) {
+	t.Parallel()
+
+	ctx := t.Context()
+
+	tc := newTestCase(t, "cache_corrupt_blob.yaml")
+
+	tc.startAgent()
+	build := tc.triggerBuild()
+	state := tc.waitForBuild(ctx, build)
+	if got, want := state, "passed"; got != want {
+		t.Errorf("Build state = %q, want %q", got, want)
+	}
+}

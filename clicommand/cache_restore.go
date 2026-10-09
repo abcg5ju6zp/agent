@@ -37,6 +37,11 @@ Cleanup is not transactional. If cleanup fails, extraction for that cache does
 not start, but target paths may already have been modified. These failures remain
 fatal even when --cache-fail-on-error is false.
 
+If a registry hit has no usable blob — the backing object is missing or
+corrupt, or the entry itself has no downloadable blob — restore degrades to a
+clean cache miss, invalidates the stale entry, and leaves the target paths
+untouched; a later save then uploads the cache again.
+
 Note: This feature is currently in development and subject to change. It is not
 yet available to all customers.
 

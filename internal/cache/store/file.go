@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"net/url"
 	"os"
@@ -23,6 +24,52 @@ import (
 const (
 	metadataSuffix = ".attrs.json"
 )
+
+var (
+	// staleTempFileAge is how old an upload/metadata temp file must be before
+	// it is treated as a crashed-upload leftover and removed at store init.
+	// A var so tests can shrink it. Younger temp files may belong to an upload
+	// another process still has in flight.
+	staleTempFileAge = time.Hour
+
+	// tempFilePrefixes are LocalFileBlob temp-name prefixes swept as crash
+	// leftovers; they must match the CreateTemp patterns in Upload.
+	tempFilePrefixes = []string{".zstash-upload-", ".zstash-meta-"}
+)
+
+// sweepStaleTempFiles removes upload/metadata temp files under root older than
+// staleTempFileAge. Best-effort: walk or individual removal failures are only
+// logged, so cleanup can never prevent the store from initializing.
+func sweepStaleTempFiles(root string) {
+	cutoff := time.Now().Add(-staleTempFileAge)
+	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil || d.IsDir() {
+			return nil
+		}
+		name := d.Name()
+		var isTemp bool
+		for _, prefix := range tempFilePrefixes {
+			if strings.HasPrefix(name, prefix) {
+				isTemp = true
+				break
+			}
+		}
+		if !isTemp {
+			return nil
+		}
+		info, err := d.Info()
+		if err != nil || info.ModTime().After(cutoff) {
+			return nil
+		}
+		if err := os.Remove(path); err != nil {
+			slog.Warn("failed to remove stale cache temp file", "path", path, "error", err)
+		}
+		return nil
+	})
+	if err != nil {
+		slog.Warn("failed to walk cache store while sweeping stale temp files", "root", root, "error", err)
+	}
+}
 
 // LocalFileBlob implements the Blob interface for local filesystem storage.
 // Cache artifacts are stored as files with accompanying JSON metadata sidecars.
@@ -107,6 +154,10 @@ func NewLocalFileBlob(ctx context.Context, fileURL string) (*LocalFileBlob, erro
 	if err := os.MkdirAll(root, 0o755); err != nil {
 		return nil, fmt.Errorf("failed to create root directory: %w", err)
 	}
+
+	// Abandon any temp files a crashed process left behind (only files older
+	// than staleTempFileAge, so in-flight uploads are untouched).
+	sweepStaleTempFiles(root)
 
 	slog.Debug("configured local file store", "root", root)
 

@@ -50,6 +50,15 @@ Archives are stored under a digest of their contents. If the store already holds
 an archive with the same digest and size, the entry is saved without uploading
 it again. --force always uploads.
 
+If a previous save to the same cache object was interrupted (an upload failure
+or an agent restart), the next save resumes the incomplete multipart upload —
+reusing the parts already uploaded and sending only the missing parts — or
+aborts it and uploads again if it cannot be resumed. A blob that restore
+observed as corrupt is re-uploaded rather than trusted, so a failed save can
+neither be restored nor pollute a later hit. With S3, discovering and resuming
+an incomplete upload additionally requires the s3:ListBucketMultipartUploads
+and s3:ListParts permissions.
+
 Configuration File Format:
 
 The cache configuration file should be in YAML format. cache_key is an ordered

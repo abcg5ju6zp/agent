@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -659,6 +660,23 @@ func TestNscStore_Stat(t *testing.T) {
 		_, _, err := stat(t, &CommandResult{Stdout: `{"size":4096,"status":"STATE_UNKNOWN"}`})
 		if err == nil || errors.Is(err, ErrBlobNotFound) {
 			t.Errorf("Stat err = %v, want a non-ErrBlobNotFound error", err)
+		}
+	})
+
+	// Concrete unfinished/terminal-but-unavailable nsc statuses must never be
+	// treated as restorable: Stat returns an error, no size, and not
+	// ErrBlobNotFound (so an interrupted upload is not confused with a miss).
+	t.Run("unfinished and non-live statuses return no size", func(t *testing.T) {
+		for _, status := range []string{"UPLOADING", "PROCESSING", "FAILED", "ABORTED"} {
+			size, _, err := stat(t, &CommandResult{
+				Stdout: fmt.Sprintf(`{"size":4096,"status":%q}`, status),
+			})
+			if err == nil || errors.Is(err, ErrBlobNotFound) {
+				t.Errorf("status %s: Stat err = %v, want a non-ErrBlobNotFound error", status, err)
+			}
+			if size != 0 {
+				t.Errorf("status %s: Stat size = %d, want 0", status, size)
+			}
 		}
 	})
 

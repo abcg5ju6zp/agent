@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/buildkite/agent/v4/api"
@@ -60,6 +61,36 @@ type client struct {
 	force      bool
 	caches     []configuration.Cache
 	onProgress ProgressCallback
+
+	// suspectBlobs holds digest values Restore observed as bad (a digest
+	// mismatch or a failed archive verification). A later Save in the same
+	// process uploads those blobs rather than trusting a same-size object, so
+	// one failure cannot be re-committed and pollute the next hit. The state
+	// is per-process and resets on restart; it needs no API or config change.
+	suspectMu    sync.Mutex
+	suspectBlobs map[string]struct{}
+}
+
+// markBlobSuspect records digest as observed bad. It lazily initializes the
+// set so clients constructed outside newClient (e.g. in older tests) work too.
+func (c *client) markBlobSuspect(digest string) {
+	if digest == "" {
+		return
+	}
+	c.suspectMu.Lock()
+	defer c.suspectMu.Unlock()
+	if c.suspectBlobs == nil {
+		c.suspectBlobs = map[string]struct{}{}
+	}
+	c.suspectBlobs[digest] = struct{}{}
+}
+
+// isBlobSuspect reports whether digest was observed bad by this process.
+func (c *client) isBlobSuspect(digest string) bool {
+	c.suspectMu.Lock()
+	defer c.suspectMu.Unlock()
+	_, ok := c.suspectBlobs[digest]
+	return ok
 }
 
 // newClient builds a client from apiClient and cfg: loads and expands the
@@ -96,13 +127,14 @@ func newClient(l logger.Logger, apiClient cacheAPI, cfg Config) (*client, []stri
 	}
 
 	c := &client{
-		api:       apiClient,
-		bucketURL: cfg.BucketURL,
-		format:    "zip",
-		platform:  fmt.Sprintf("%s/%s", runtime.GOOS, runtime.GOARCH),
-		registry:  registry,
-		force:     cfg.Force,
-		caches:    expanded,
+		api:          apiClient,
+		bucketURL:    cfg.BucketURL,
+		format:       "zip",
+		platform:     fmt.Sprintf("%s/%s", runtime.GOOS, runtime.GOARCH),
+		registry:     registry,
+		force:        cfg.Force,
+		caches:       expanded,
+		suspectBlobs: map[string]struct{}{},
 		onProgress: func(cacheID, stage, message string, _, _ int) {
 			l.WithFields(
 				logger.StringField("cache_id", cacheID),

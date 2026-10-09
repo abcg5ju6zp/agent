@@ -281,7 +281,7 @@ func (c *client) Save(ctx context.Context, cacheID string) (SaveResult, error) {
 	// A skipped blob's retention is deliberately not refreshed: restore refreshes
 	// it only after the digest verifies, so a good blob in use stays alive while
 	// a corrupt one ages out instead of being kept alive by every save.
-	result.UploadSkipped = !c.force && blobAlreadyStored(ctx, blobStore, storeObjectName, archiveInfo.Size)
+	result.UploadSkipped = !c.force && c.blobAlreadyStored(ctx, blobStore, storeObjectName, archiveInfo.Size)
 	span.SetAttributes(attribute.Bool("cache.upload_skipped", result.UploadSkipped))
 
 	transferInfo := &store.TransferInfo{}
@@ -295,6 +295,12 @@ func (c *client) Save(ctx context.Context, cacheID string) (SaveResult, error) {
 			span.RecordError(err)
 			span.SetStatus(codes.Error, "failed to upload cache")
 			return result, fmt.Errorf("failed to upload cache: %w", err)
+		}
+		if transferInfo.Resumed {
+			slog.Info("resumed an incomplete multipart upload left by a previous save",
+				"cache_id", cacheID,
+				"bytes_transferred", transferInfo.BytesTransferred,
+				"part_count", transferInfo.PartCount)
 		}
 
 		// Populate transfer metrics
@@ -378,8 +384,15 @@ func (c *client) Save(ctx context.Context, cacheID string) (SaveResult, error) {
 
 // blobAlreadyStored reports whether blobStore already holds key with the
 // expected size. The size check catches a truncated blob, not a corrupted one.
+// A key Restore observed bad earlier in this process is never trusted, even if
+// its size matches, so a poisoned blob cannot be re-committed by a later save.
 // Any error means "not stored", so a failed check costs an upload, never a save.
-func blobAlreadyStored(ctx context.Context, blobStore store.Blob, key string, size int64) bool {
+func (c *client) blobAlreadyStored(ctx context.Context, blobStore store.Blob, key string, size int64) bool {
+	if c.isBlobSuspect(key) {
+		slog.Warn("cache blob was found bad earlier in this process, uploading instead of skipping",
+			"key", key)
+		return false
+	}
 	got, err := blobStore.Stat(ctx, key)
 	switch {
 	case errors.Is(err, store.ErrBlobNotFound):

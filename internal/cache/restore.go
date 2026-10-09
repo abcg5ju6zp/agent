@@ -27,6 +27,12 @@ import (
 // partial state. Unlike a pre-mutation failure it is not equivalent to a cache
 // miss, so it stays fatal even when cache errors are otherwise fail-open —
 // continuing would run the build against half-restored targets.
+// errStaleEntryStructure marks a retrieve hit whose blobs list is empty or
+// whose blob has no digest value: an old or corrupt registry row with nothing
+// downloadable. Like an unrecognized archive, it is handled before target
+// paths are touched, so it is equivalent to a cache miss.
+var errStaleEntryStructure = errors.New("cache entry has no downloadable blob")
+
 var errRestoreMutatedTargets = errors.New("cache restore failed after modifying target paths")
 
 // restoreCleanupError preserves the filesystem cause and fatal mutation marker.
@@ -224,12 +230,13 @@ func (c *client) Restore(ctx context.Context, cacheID string) (RestoreResult, er
 			// The blob doesn't match its fingerprint. downloadCache verified this
 			// before any target folder was touched, so existing files are intact.
 			// The blob will never verify, so expire the entry and let the build
-			// continue with a clean miss. A subsequent save re-uploads unless the
-			// stored blob has the same size as the new archive, in which case save
-			// skips the upload and the bad blob stays until it expires (restore
-			// never refreshes its retention, as it never verifies).
+			// continue with a clean miss. A subsequent save in the same process
+			// re-uploads rather than trusting a same-size blob — Restore marks
+			// the digest as suspect; on another agent the bad blob ages out
+			// because a restore never refreshes its retention.
 			slog.Warn("cache blob digest mismatch, treating as miss and invalidating entry",
 				"cache_id", cacheID, "err", err)
+			c.markBlobSuspect(retrieveResp.Blobs[0].Digest.Value)
 			invalidated := c.invalidateStaleEntry(ctx, retrieveResp)
 			result.CacheHit = false
 			result.FallbackUsed = false
@@ -243,6 +250,26 @@ func (c *client) Restore(ctx context.Context, cacheID string) (RestoreResult, er
 			)
 			span.SetStatus(codes.Ok, "cache miss (digest mismatch)")
 			result.NotRestoredReason = missCompleteMessage("blob digest mismatch", invalidated)
+			c.callProgress(cacheID, "complete", result.NotRestoredReason, 0, 0)
+			return result, nil
+		}
+		if errors.Is(err, errStaleEntryStructure) {
+			// Old/corrupt registry row: nothing downloadable, targets untouched.
+			slog.Warn("cache entry has no downloadable blob, treating as miss and invalidating entry",
+				"cache_id", cacheID)
+			invalidated := c.invalidateStaleEntry(ctx, retrieveResp)
+			result.CacheHit = false
+			result.FallbackUsed = false
+			result.CacheRestored = false
+			result.TotalDuration = time.Since(startTime)
+			span.SetAttributes(
+				attribute.Bool("cache.hit", false),
+				attribute.Bool("cache.restored", false),
+				attribute.Bool("cache.stale_structure", true),
+				attribute.Bool("cache.invalidated", invalidated),
+			)
+			span.SetStatus(codes.Ok, "cache miss (stale entry structure)")
+			result.NotRestoredReason = missCompleteMessage("stale entry structure", invalidated)
 			c.callProgress(cacheID, "complete", result.NotRestoredReason, 0, 0)
 			return result, nil
 		}
@@ -272,6 +299,7 @@ func (c *client) Restore(ctx context.Context, cacheID string) (RestoreResult, er
 		unrecognized := errors.Is(err, archive.ErrUnrecognizedFormat)
 		slog.Warn("cache archive failed verification, treating as miss and invalidating entry",
 			"cache_id", cacheID, "unrecognized_format", unrecognized, "err", err)
+		c.markBlobSuspect(retrieveResp.Blobs[0].Digest.Value)
 		invalidated := c.invalidateStaleEntry(ctx, retrieveResp)
 		result.CacheHit = false
 		result.FallbackUsed = false
@@ -551,9 +579,12 @@ func (c *client) downloadCache(ctx context.Context, retrieveResp api.CacheEntryR
 	// blob and we download blobs[0]. The blobs field is an array to leave room
 	// for content-defined chunking later (one entry → many chunk-blobs)
 	if len(retrieveResp.Blobs) == 0 {
-		return "", "", nil, fmt.Errorf("cache entry has no blobs to download")
+		return "", "", nil, errStaleEntryStructure
 	}
 	storeObjectName := retrieveResp.Blobs[0].Digest.Value
+	if storeObjectName == "" {
+		return "", "", nil, errStaleEntryStructure
+	}
 
 	span.SetAttributes(
 		attribute.String("cache.store_type", retrieveResp.Store),

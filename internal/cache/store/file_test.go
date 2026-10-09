@@ -8,6 +8,7 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestNewLocalFileBlob(t *testing.T) {
@@ -582,6 +583,156 @@ func TestNewBlobStoreAgentManagedFile(t *testing.T) {
 	}
 	if _, ok := blob.(*LocalFileBlob); !ok {
 		t.Errorf("expected LocalFileBlob type, got %T", blob)
+	}
+}
+
+// TestSweepStaleTempFiles covers TR-2.1/2.2: crash leftover temp files older
+// than the threshold are removed, younger temp files (possibly in flight) are
+// kept, and real data/sidecar files are never touched.
+func TestSweepStaleTempFiles(t *testing.T) {
+	ctx := t.Context()
+	rootDir := filepath.Join(t.TempDir(), "cache-root")
+	if err := os.MkdirAll(rootDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	staleUpload := filepath.Join(rootDir, ".zstash-upload-stale")
+	staleMeta := filepath.Join(rootDir, ".zstash-meta-stale")
+	youngUpload := filepath.Join(rootDir, ".zstash-upload-young")
+	dataFile := filepath.Join(rootDir, "real-data")
+	sidecar := filepath.Join(rootDir, "real-data.attrs.json")
+
+	for path, content := range map[string]string{
+		staleUpload: "stale upload bytes",
+		staleMeta:   "stale meta bytes",
+		youngUpload: "young upload bytes",
+		dataFile:    "real data",
+		sidecar:     "{}",
+	} {
+		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	past := time.Now().Add(-2 * time.Hour)
+	for _, path := range []string{staleUpload, staleMeta} {
+		if err := os.Chtimes(path, past, past); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	blob, err := NewLocalFileBlob(ctx, fileURL(rootDir))
+	if err != nil {
+		t.Fatalf("NewLocalFileBlob: %v", err)
+	}
+	if blob == nil {
+		t.Fatal("expected non-nil blob")
+	}
+
+	for path, want := range map[string]bool{
+		staleUpload: false,
+		staleMeta:   false,
+		youngUpload: true,
+		dataFile:    true,
+		sidecar:     true,
+	} {
+		_, err := os.Stat(path)
+		if got := !os.IsNotExist(err); got != want {
+			t.Errorf("file %q exists = %t, want %t", path, got, want)
+		}
+	}
+}
+
+// TestSweepStaleTempFilesRemoveError covers TR-2.3: a temp file that cannot be
+// removed (read-only parent directory) only produces a logged warning; the
+// store still initializes.
+func TestSweepStaleTempFilesRemoveError(t *testing.T) {
+	if os.Getuid() == 0 {
+		t.Skip("root bypasses directory write permissions")
+	}
+	ctx := t.Context()
+	baseDir := filepath.Join(t.TempDir(), "cache-root")
+	lockedDir := filepath.Join(baseDir, "locked")
+	if err := os.MkdirAll(lockedDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	lockedFile := filepath.Join(lockedDir, ".zstash-upload-stale")
+	if err := os.WriteFile(lockedFile, []byte("stuck"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	past := time.Now().Add(-2 * time.Hour)
+	if err := os.Chtimes(lockedFile, past, past); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(lockedDir, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(lockedDir, 0o755) })
+
+	blob, err := NewLocalFileBlob(ctx, fileURL(baseDir))
+	if err != nil {
+		t.Fatalf("NewLocalFileBlob should still succeed: %v", err)
+	}
+	if blob == nil {
+		t.Fatal("expected non-nil blob")
+	}
+	if _, err := os.Stat(lockedFile); err != nil {
+		t.Errorf("locked temp file should remain after failed removal: %v", err)
+	}
+}
+
+// TestLocalFileBlobDownloadBadSidecar covers AC-6(c): a missing, truncated or
+// invalid-JSON metadata sidecar (e.g. an older/partial format) must not break
+// download — sidecar metadata is best-effort.
+func TestLocalFileBlobDownloadBadSidecar(t *testing.T) {
+	ctx := t.Context()
+	blob, err := NewLocalFileBlob(ctx, fileURL(filepath.Join(t.TempDir(), "cache-root")))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	src := filepath.Join(t.TempDir(), "src.txt")
+	content := []byte("sidecar tolerance")
+	if err := os.WriteFile(src, content, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	const key = "sidecar-key"
+	if _, err := blob.Upload(ctx, src, key, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, tc := range []struct {
+		name string
+		bad  func(metaPath string)
+	}{
+		{name: "missing", bad: func(metaPath string) {
+			_ = os.Remove(metaPath)
+		}},
+		{name: "truncated", bad: func(metaPath string) {
+			_ = os.WriteFile(metaPath, []byte(`{"vers`), 0o600)
+		}},
+		{name: "invalid json", bad: func(metaPath string) {
+			_ = os.WriteFile(metaPath, []byte("not json at all"), 0o600)
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dataPath, metaPath, err := blob.keyToPaths(key)
+			if err != nil {
+				t.Fatal(err)
+			}
+			tc.bad(metaPath)
+
+			dest := filepath.Join(t.TempDir(), "dest.txt")
+			if _, err := blob.Download(ctx, key, dest); err != nil {
+				t.Fatalf("Download with %s sidecar: %v", tc.name, err)
+			}
+			got, err := os.ReadFile(dest)
+			if err != nil || !bytes.Equal(got, content) {
+				t.Errorf("content = %q, want %q (err %v)", got, content, err)
+			}
+			_ = dataPath
+		})
 	}
 }
 

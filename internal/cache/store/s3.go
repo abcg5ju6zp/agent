@@ -189,6 +189,7 @@ func downloadWithRetry(ctx context.Context, r *roko.Retrier, d objectDownloader,
 type S3Blob struct {
 	client              objectCopier
 	header              objectHeader
+	mpu                 s3MPUAPI
 	uploader            *manager.Uploader   //nolint:staticcheck // SA1019: pending migration to transfermanager
 	downloader          *manager.Downloader //nolint:staticcheck // SA1019: pending migration to transfermanager
 	bucketName          string
@@ -264,6 +265,7 @@ func NewS3Blob(ctx context.Context, s3url string) (*S3Blob, error) {
 	return &S3Blob{
 		client:              client,
 		header:              client,
+		mpu:                 client,
 		uploader:            uploader,
 		downloader:          downloader,
 		bucketName:          opts.Bucket,
@@ -346,6 +348,42 @@ func (b *S3Blob) Upload(ctx context.Context, filePath, key string, _ time.Durati
 		"concurrency", b.uploadConcurrency,
 	)
 
+	// First try to resume an incomplete multipart upload a previous
+	// (crashed or interrupted) save left on this exact key. Finding none is
+	// the normal case; any resume failure falls back to a fresh upload.
+	if info, resumeErr := b.tryResumeUpload(ctx, file, fullKey, bytesWritten, start); resumeErr == nil {
+		slog.Debug("completed S3 upload by resuming previous multipart upload",
+			"key", fullKey,
+			"parts_uploaded", info.PartCount,
+			"bytes_transferred", info.BytesTransferred,
+		)
+		span.SetAttributes(
+			attribute.Int64("bytes_transferred", info.BytesTransferred),
+			attribute.String("transfer_speed", fmt.Sprintf("%.2fMB/s", info.TransferSpeed)),
+			attribute.String("request_id", info.RequestID),
+			attribute.Int("part_count", info.PartCount),
+			attribute.Int("concurrency", info.Concurrency),
+		)
+		return info, nil
+	} else {
+		switch {
+		case errors.Is(resumeErr, errNoResumableUpload):
+			// Normal case: nothing resumable existed.
+		case errors.Is(resumeErr, errStaleUploadAbandoned):
+			// A non-resumable upload was found and aborted; the decision was
+			// already logged inside the resume path.
+		default:
+			slog.Warn("failed to resume previous multipart upload, starting a fresh upload",
+				"key", fullKey, "error", resumeErr)
+		}
+	}
+
+	// Resume reads the file at arbitrary offsets; rewind before handing it to
+	// the uploader.
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		return nil, fmt.Errorf("failed to rewind file before upload: %w", err)
+	}
+
 	// Upload the file to S3 using the multipart uploader
 	result, err := b.uploader.Upload(ctx, &s3.PutObjectInput{ //nolint:staticcheck // SA1019: pending migration to transfermanager
 		Bucket: aws.String(b.bucketName),
@@ -353,6 +391,10 @@ func (b *S3Blob) Upload(ctx context.Context, filePath, key string, _ time.Durati
 		Body:   file,
 	})
 	if err != nil {
+		// The SDK already attempts an abort, but with the call context; if
+		// that context is cancelled the abort can fail, so clean up any
+		// surviving multipart upload with an independent context.
+		b.bestEffortAbortForKey(ctx, fullKey)
 		return nil, fmt.Errorf("failed to upload file to S3: %w", err)
 	}
 
