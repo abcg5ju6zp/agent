@@ -17,6 +17,14 @@ type controllerConfig struct {
 	allowHTTP2        bool
 	priority          string
 	scriptEvalEnabled bool
+
+	// scheduling registers the agent as dispatchable (participating in
+	// regular scheduling) instead of ignore-in-dispatches mode.
+	scheduling bool
+
+	// noDelays removes waits between pings and stream reconnection
+	// attempts. It is only usable from in-package tests.
+	noDelays bool
 }
 
 // ControllerOption is a functional option for setting optional behaviour.
@@ -82,5 +90,20 @@ func WithPriority(priority string) ControllerOption {
 func WithScriptEvalEnabled(enabled bool) ControllerOption {
 	return func(c *controllerConfig) {
 		c.scriptEvalEnabled = enabled
+	}
+}
+
+// WithScheduling enables regular scheduling mode. The agent is registered as
+// dispatchable (ignore-in-dispatches is false), and [Controller.RunDispatch]
+// can be used to receive jobs and pause, resume and disconnect instructions
+// from the control plane, using streaming dispatch when the server supports
+// it and falling back to polling-based pings otherwise.
+//
+// Without this option (the default), the agent is registered with
+// ignore-in-dispatches set, does not participate in scheduling, and only
+// [Controller.AcquireJob] can obtain jobs.
+func WithScheduling() ControllerOption {
+	return func(c *controllerConfig) {
+		c.scheduling = true
 	}
 }
